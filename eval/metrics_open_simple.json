@@ -1,0 +1,8 @@
+{
+  "semantic_similarity_avg": 0.458,
+  "key_facts_coverage_avg": 0.531,
+  "p50_latency_ms": 13050.8,
+  "p95_latency_ms": 18332.0,
+  "error_rate": 0.0,
+  "count": 60
+}
