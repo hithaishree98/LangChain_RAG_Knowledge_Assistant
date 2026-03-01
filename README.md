@@ -28,11 +28,11 @@ That's what this project is. It started as a way for me to deeply learn RAG arch
         ↓
    File is parsed by the appropriate loader (PyPDF, Docx2txt, Unstructured)
         ↓
-   Content is split into overlapping chunks 
+   Content is split into overlapping chunks
         ↓
-   Each chunk is embedded using HuggingFace nomic-embed-text-v1.5 
+   Each chunk is embedded using HuggingFace nomic-embed-text-v1.5
         ↓
-   Embeddings + metadata stored in ChromaDB 
+   Embeddings + metadata stored in ChromaDB
 
 2. Query
    User asks a question
@@ -54,7 +54,6 @@ That's what this project is. It started as a way for me to deeply learn RAG arch
         ↓
    Everything logged to SQLite — session, question, answer, confidence, sources
 
----
 
 ## Setup Instructions
 
