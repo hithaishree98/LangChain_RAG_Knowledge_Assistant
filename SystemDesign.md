@@ -72,7 +72,9 @@ When someone asks a question, it goes through the same embedding step and Chroma
 
 - **Prompt and Guardrails**
 
-  RTCTO 
+  Prompt is structured as role, context, task, constraints and output.
+
+  The model is strictly instructed to use only retrieved context, never rely on outside knowledge, never fabricate details, and return a fixed fallback sentence when evidence is missing.
   
 - **Fault Tolerance and Degradation**
   
