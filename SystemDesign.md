@@ -42,24 +42,29 @@ When someone asks a question, it goes through the same embedding step and Chroma
 ## System design concepts in this project
 
 - Client-Server Architecture
+  
 The frontend and backend are completely separate services. Streamlit handles the UI, FastAPI handles everything else. They communicate over HTTP.
 
  Someone could replace the Streamlit frontend with a Slack bot or a Chrome extension without touching a single line of the RAG logic. That separation was intentional from the start.
 
 - Multi-Tenancy and Data Isolation
+  
 One deployment, many workspaces, zero data leakage between them. Every document chunk and every database row is tagged with a user_id.
 
 Chroma filters on user_id at query time. SQLite queries include WHERE user_id = ?.
 
 - Retrieval Augmented Generation (RAG)
+  
 RAG stores documents as vectors and retrieves only the relevant chunks at query time.
 
 Since customer data changes constantly, fine-tuning would require retraining every time anything changes.
 
 - Vector Similarity Search
+  
 Text gets converted into high-dimensional vectors where semantic similarity maps to mathematical closeness.
 
 - Fault Tolerance and Graceful Degradation
+  
 Things fail in production like LLMs go down, databases lock, networks timeout.
 
   The system handles each failure independently. 
@@ -70,6 +75,7 @@ Things fail in production like LLMs go down, databases lock, networks timeout.
 The pattern throughout: non-critical paths fail silently and log the error, critical paths retry and surface the error cleanly.
 
 - Idempotency and Atomic Operations
+  
 If document indexing fails halfway through, the database record gets cleaned up.
 
 Temp files are deleted in a finally block so they're always cleaned up even if an exception is thrown. 
