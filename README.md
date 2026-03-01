@@ -18,7 +18,7 @@ That's what this project is. It started as a way for me to deeply learn RAG arch
 - Confidence scoring on every response
 - Bulk mode let's you upload a CSV of questions, get all answers back at once (useful for RFPs or questionnaires)
 - List and delete indexed files per user
-- Slack notifications when confidence drops below threshold, escalate to a human automatically
+- Slack notifications when check box selected
 - Full audit log of every query, answer, and confidence score
 - Usage analytics per session
 
@@ -50,8 +50,6 @@ That's what this project is. It started as a way for me to deeply learn RAG arch
 
 3. Response
    Answer returned with confidence score and source file references
-        ↓
-   If confidence < 0.4 → flagged for escalation, Slack notification sent (if configured)
         ↓
    Everything logged to SQLite — session, question, answer, confidence, sources
 ```
