@@ -83,7 +83,7 @@ Temp files are deleted in a finally block so they're always cleaned up even if a
 Duplicate uploads are rejected with a 409 before any work is done. 
 
 - **Observability**
-  
- - Structured JSON logs for debugging individual requests
- - business metrics via /analytics for understanding usage patterns
- - audit trail of every query and response.
+
+  - Structured JSON logs for debugging individual requests
+  - business metrics via /analytics for understanding usage patterns
+  - audit trail of every query and response.
