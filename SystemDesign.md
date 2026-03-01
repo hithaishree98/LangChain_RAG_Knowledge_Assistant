@@ -55,32 +55,32 @@ When someone asks a question, it goes through the same embedding step and Chroma
 
 - **Retrieval Augmented Generation (RAG)**
   
-  RAG stores documents as vectors and retrieves only the relevant chunks at query time.
+   RAG stores documents as vectors and retrieves only the relevant chunks at query time.
 
-, Since customer data changes constantly, fine-tuning would require retraining every time anything changes.
+   Since customer data changes constantly, fine-tuning would require retraining every time anything changes.
 
 - **Vector Similarity Search**
   
-Text gets converted into high-dimensional vectors where semantic similarity maps to mathematical closeness.
+  Text gets converted into high-dimensional vectors where semantic similarity maps to mathematical closeness.
 
 - **Fault Tolerance and Graceful Degradation**
   
-Things fail in production like LLMs go down, databases lock, networks timeout.
+  Things fail in production like LLMs go down, databases lock, networks timeout.
 
- - The system handles each failure independently. 
-   - LLM failures retry with exponential backoff (wait 1s, then 2s, then return 503).
-   - Slack notification failures don't affect the answer.
-   - Database write failures don't corrupt the session.
+   - The system handles each failure independently. 
+     - LLM failures retry with exponential backoff (wait 1s, then 2s, then return 503).
+     - Slack notification failures don't affect the answer.
+     - Database write failures don't corrupt the session.
 
-The pattern throughout: non-critical paths fail silently and log the error, critical paths retry and surface the error cleanly.
+  The pattern throughout: non-critical paths fail silently and log the error, critical paths retry and surface the error cleanly.
 
 - **Idempotency and Atomic Operations**
   
-If document indexing fails halfway through, the database record gets cleaned up.
+  If document indexing fails halfway through, the database record gets cleaned up.
 
-Temp files are deleted in a finally block so they're always cleaned up even if an exception is thrown. 
+  Temp files are deleted in a finally block so they're always cleaned up even if an exception is thrown. 
 
-Duplicate uploads are rejected with a 409 before any work is done. 
+  Duplicate uploads are rejected with a 409 before any work is done. 
 
 - **Observability**
 
@@ -91,23 +91,23 @@ Duplicate uploads are rejected with a 409 before any work is done.
 - **Security in Depth**
   
   - Input validation blocks malformed requests (max file size, allowed extensions, max question length).
-  - Authentication via API key header.
-  - Authorization via user_id filtering at the database level
-  - LLM guardrail prompt prevents hallucination
+   - Authentication via API key header.
+   - Authorization via user_id filtering at the database level
+   - LLM guardrail prompt prevents hallucination
  
 - **Deterministic Hashing for Identity**
   
-The workspace and passkey get hashed together to produce a consistent user_id.
+  The workspace and passkey get hashed together to produce a consistent user_id.
 
-Same inputs always produce the same hash. Different passkey produces a completely different hash. 
+  Same inputs always produce the same hash. Different passkey produces a completely different hash. 
 
-This gives persistent workspace identity without a user table, password storage, or session management.
+  This gives persistent workspace identity without a user table, password storage, or session management.
 
 - **Logging**
   
-Custom StructuredLogger that writes every event as a single line of JSON. Every API call, LLM retry, upload, deletion, and error gets logged.
+  Custom StructuredLogger that writes every event as a single line of JSON. Every API call, LLM retry, upload, deletion, and error gets logged.
 
-JSON was preferred as it is parseable. We can filter by event type, timestamp, and also answer questions like "how many queries had confidence below 0.4 this week?".
+  JSON was preferred as it is parseable. We can filter by event type, timestamp, and also answer questions like "how many queries had confidence below 0.4 this week?".
 
 ## Tools used
 - Groq
