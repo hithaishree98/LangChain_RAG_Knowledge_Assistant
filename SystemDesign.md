@@ -4,6 +4,8 @@ This document explains the architectural choices, tradeoffs, problems that force
 
 ## High Level Architecture
 
+Two separate services — a FastAPI backend and a Streamlit frontend, talking to each other over HTTP.
+
 ```
         
    Streamlit Frontend  ──────▶         FastAPI Backend           
@@ -47,10 +49,9 @@ When someone asks a question, it goes through the same embedding step and Chroma
         
    Someone could replace the Streamlit frontend with a Slack bot or a Chrome extension without touching a single line of the RAG logic. That separation was intentional from the start.
 
-- **Multi-Tenancy and Data Isolation**
+- **Data Isolation**
   
-   One deployment, many workspaces, zero data leakage between them. Every document chunk and every database row is tagged with a user_id.
-        
+   Every document chunk and every database row is tagged with a user_id.
    Chroma filters on user_id at query time. SQLite queries include WHERE user_id = ?.
 
 - **Retrieval Augmented Generation (RAG)**
@@ -63,7 +64,17 @@ When someone asks a question, it goes through the same embedding step and Chroma
   
   Text gets converted into high-dimensional vectors where semantic similarity maps to mathematical closeness.
 
-- **Fault Tolerance and Graceful Degradation**
+- **LLM Determinism — temperature set to zero**
+  
+  Temperature controls how random the LLM's output is.
+
+  For an FDE using this in front of a customer, answers that randomly vary on every run would completely undermine trust. Hence temperature is set to 0 deliberately to reduce randomness.
+
+- **Prompt and Guardrails**
+
+  RTCTO 
+  
+- **Fault Tolerance and Degradation**
   
   Things fail in production like LLMs go down, databases lock, networks timeout.
 
@@ -72,30 +83,37 @@ When someone asks a question, it goes through the same embedding step and Chroma
      - Slack notification failures don't affect the answer.
      - Database write failures don't corrupt the session.
 
-  The pattern throughout: non-critical paths fail silently and log the error, critical paths retry and surface the error cleanly.
-
 - **Idempotency and Atomic Operations**
   
   If document indexing fails halfway through, the database record gets cleaned up.
 
   Temp files are deleted in a finally block so they're always cleaned up even if an exception is thrown. 
 
-  Duplicate uploads are rejected with a 409 before any work is done. 
+  Duplicate uploads are rejected with a 409 before any work is done.
+
+- **Input Validation**
+
+  Every request is checked before any work starts. A 200MB file or a 10,000-character question gets rejected immediately with a clear 400 error. 
+  
 
 - **Observability**
 
   - Structured JSON logs for debugging individual requests
   - business metrics via /analytics for understanding usage patterns
   - audit trail of every query and response.
+
+- **Health check**
+- 
+    To check whether the database, vector store, and LLM key are all working.
  
-- **Security in Depth**
+- **Security**
   
   - Input validation blocks malformed requests (max file size, allowed extensions, max question length).
    - Authentication via API key header.
    - Authorization via user_id filtering at the database level
    - LLM guardrail prompt prevents hallucination
  
-- **Deterministic Hashing for Identity**
+- **Deterministic Hashing**
   
   The workspace and passkey get hashed together to produce a consistent user_id.
 
