@@ -1,15 +1,16 @@
 # FDE Customer Context Assistant (FastAPI · Streamlit · Chroma · Groq)
 
-The FDE Customer Context Assistant is a RAG-powered document Q&A tool built for customer-facing technical teams. Upload PDFs, Word docs, or HTML files and query them conversationally. The assistant only answers from what's in your documents and if the answer isn't there, it says so. That's intentional. 
+The FDE Customer Context Assistant is a RAG-powered document Q&A tool built for customer-facing technical teams. Upload PDFs, Word docs, or HTML files and query them in plain english. The assistant only answers from what's in your documents and if the answer isn't there, it says so. 
+
 In a customer context, a confident wrong answer is worse than admitting uncertainty.
 
 ## Problem Context
 
-While learning about RAG systems and LangChain, one specific pain point I'd observed and read about in SE/FDE workflows: customer-facing engineers spend a surprising amount of time during calls or follow-ups just searching for answers that already exist somewhere in a document. A product manual, a technical spec, a contract, an FAQ. The knowledge is not instantly accessible when you need it.
+While learning about RAG systems and LangChain, one specific pain point I'd observed and read about in SE/FDE workflows is that before every customer call you need to know what was last discussed, what was promised, what's broken right now, what their tech stack looks like, when their contract renews. That information exists but it's just everywhere(on slack, email. notion, git, perosnal notes).
 
-That's what this project is. It started as a way for me to deeply learn RAG architecture, but I built it with a real SE/FDE use case in mind, a tool that lets you upload your customer documents and ask questions against them in plain English. No Ctrl+F, no digging through folders. Just ask and get a grounded answer with a source reference.
+That's what this project is. It started as a way for me to deeply learn RAG architecture, but I built it with a real SE/FDE use case in mind, a tool that lets you upload your customer documents and ask questions against them in plain English so you can pull all of this context together before you get on a call.
 
-## Core capabilities
+## What it does
 
 - Upload and index PDF, DOCX, and HTML documents
 - Ask questions in natural language, get answers with source references
