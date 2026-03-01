@@ -43,15 +43,15 @@ When someone asks a question, it goes through the same embedding step and Chroma
 
 - **Client-Server Architecture**
   
-        The frontend and backend are completely separate services. Streamlit handles the UI, FastAPI handles everything else. They communicate over HTTP.
+  The frontend and backend are completely separate services. Streamlit handles the UI, FastAPI handles everything else. They communicate over HTTP.
         
-         Someone could replace the Streamlit frontend with a Slack bot or a Chrome extension without touching a single line of the RAG logic. That separation was intentional from the start.
+   Someone could replace the Streamlit frontend with a Slack bot or a Chrome extension without touching a single line of the RAG logic. That separation was intentional from the start.
 
 - **Multi-Tenancy and Data Isolation**
   
-        One deployment, many workspaces, zero data leakage between them. Every document chunk and every database row is tagged with a user_id.
+   One deployment, many workspaces, zero data leakage between them. Every document chunk and every database row is tagged with a user_id.
         
-        Chroma filters on user_id at query time. SQLite queries include WHERE user_id = ?.
+   Chroma filters on user_id at query time. SQLite queries include WHERE user_id = ?.
 
 - **Retrieval Augmented Generation (RAG)**
   
