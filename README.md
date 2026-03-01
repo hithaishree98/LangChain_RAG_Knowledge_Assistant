@@ -55,6 +55,11 @@ That's what this project is. It started as a way for me to deeply learn RAG arch
         ↓
    Everything logged to SQLite — session, question, answer, confidence, sources
 ```
+## Why Rag
+
+Customer data changes constantly. Fine tuning a  model requires training the model frequently to know everything about your customers which is not feasible.
+
+RAG is the right approach. Store documents as vectors. At query time, find only the relevant chunks and send those to the LLM. Works with unlimited documents, cheap per query, documents can be added any time, no retraining needed.
 
 ## Setup Instructions
 
