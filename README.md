@@ -1,6 +1,7 @@
 # FDE Customer Context Assistant (FastAPI · Streamlit · Chroma · Groq)
 
-The FDE Customer Context Assistant is a RAG-powered document Q&A tool built for customer-facing technical teams. Upload PDFs, Word docs, or HTML files and query them conversationally. The assistant only answers from what's in your documents and if the answer isn't there, it says so. That's intentional. In a customer context, a confident wrong answer is worse than admitting uncertainty.
+The FDE Customer Context Assistant is a RAG-powered document Q&A tool built for customer-facing technical teams. Upload PDFs, Word docs, or HTML files and query them conversationally. The assistant only answers from what's in your documents and if the answer isn't there, it says so. That's intentional. 
+In a customer context, a confident wrong answer is worse than admitting uncertainty.
 
 ## Problem Context
 
