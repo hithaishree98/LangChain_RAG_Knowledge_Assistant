@@ -57,7 +57,7 @@ That's what this project is. It started as a way for me to deeply learn RAG arch
 
 ## Setup Instructions
 
-- Docker and Docker Compose installed on your machine
+Docker and Docker Compose installed on your machine
 
 Set these variables in .env
 - API_BASE_URL=http://localhost:8000
