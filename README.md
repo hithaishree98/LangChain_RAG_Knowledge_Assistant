@@ -22,7 +22,7 @@ That's what this project is. It started as a way for me to deeply learn RAG arch
 - Usage analytics per session
 
 ## How It Works
-
+```
 1. Upload
    User uploads a PDF / DOCX / HTML file
         ↓
@@ -53,7 +53,7 @@ That's what this project is. It started as a way for me to deeply learn RAG arch
    If confidence < 0.4 → flagged for escalation, Slack notification sent (if configured)
         ↓
    Everything logged to SQLite — session, question, answer, confidence, sources
-
+```
 
 ## Setup Instructions
 
