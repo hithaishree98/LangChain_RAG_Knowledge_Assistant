@@ -67,10 +67,10 @@ Text gets converted into high-dimensional vectors where semantic similarity maps
   
 Things fail in production like LLMs go down, databases lock, networks timeout.
 
-- The system handles each failure independently. 
- - LLM failures retry with exponential backoff (wait 1s, then 2s, then return 503).
- - Slack notification failures don't affect the answer.
- - Database write failures don't corrupt the session.
+ - The system handles each failure independently. 
+   - LLM failures retry with exponential backoff (wait 1s, then 2s, then return 503).
+   - Slack notification failures don't affect the answer.
+   - Database write failures don't corrupt the session.
 
 The pattern throughout: non-critical paths fail silently and log the error, critical paths retry and surface the error cleanly.
 
