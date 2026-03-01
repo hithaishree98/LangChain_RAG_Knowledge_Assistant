@@ -55,9 +55,9 @@ When someone asks a question, it goes through the same embedding step and Chroma
 
 - **Retrieval Augmented Generation (RAG)**
   
-RAG stores documents as vectors and retrieves only the relevant chunks at query time.
+  RAG stores documents as vectors and retrieves only the relevant chunks at query time.
 
-Since customer data changes constantly, fine-tuning would require retraining every time anything changes.
+, Since customer data changes constantly, fine-tuning would require retraining every time anything changes.
 
 - **Vector Similarity Search**
   
