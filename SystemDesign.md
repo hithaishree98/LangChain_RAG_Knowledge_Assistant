@@ -87,3 +87,31 @@ Duplicate uploads are rejected with a 409 before any work is done.
   - Structured JSON logs for debugging individual requests
   - business metrics via /analytics for understanding usage patterns
   - audit trail of every query and response.
+ 
+- **Security in Depth**
+  
+  - Input validation blocks malformed requests (max file size, allowed extensions, max question length).
+  - Authentication via API key header.
+  - Authorization via user_id filtering at the database level
+  - LLM guardrail prompt prevents hallucination
+ 
+- **Deterministic Hashing for Identity**
+  
+The workspace and passkey get hashed together to produce a consistent user_id.
+
+Same inputs always produce the same hash. Different passkey produces a completely different hash. 
+
+This gives persistent workspace identity without a user table, password storage, or session management.
+
+- **Logging**
+  
+Custom StructuredLogger that writes every event as a single line of JSON. Every API call, LLM retry, upload, deletion, and error gets logged.
+
+JSON was preferred as it is parseable. We can filter by event type, timestamp, and also answer questions like "how many queries had confidence below 0.4 this week?".
+
+## Tools used
+- Groq
+- nomic-embed-text
+- ChromaDB
+- SQLite
+- LangChain 
