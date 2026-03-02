@@ -64,16 +64,11 @@ RAG is the right approach. Store documents as vectors. At query time, find only 
 Docker and Docker Compose installed on your machine
 
 Set these variables in .env
-- API_BASE_URL=http://localhost:8000
-- A free Groq API key
+- API_BASE_URL
+- Groq API key
 - Slack url
-- API_KEY (if configured)
 
 ### docker-compose up --build
-
-## Open the app
-- Chat interface: http://localhost:8501
-- API documentation: http://localhost:8000/docs
 
 ## First time using it
 
