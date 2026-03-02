@@ -1,7 +1,5 @@
 # Architecture & Design Decisions
 
-This document explains the architectural choices, tradeoffs, problems that forced me to rethink things.
-
 ## High Level Architecture
 
 Two separate services — a FastAPI backend and a Streamlit frontend, talking to each other over HTTP.
