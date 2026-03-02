@@ -53,7 +53,7 @@ That's what this project is. It started as a way for me to deeply learn RAG arch
         ↓
    Everything logged to SQLite — session, question, answer, confidence, sources
 ```
-## Why Rag
+## Why this approach
 
 Customer data changes constantly. Fine tuning a  model requires training the model frequently to know everything about your customers which is not feasible.
 
