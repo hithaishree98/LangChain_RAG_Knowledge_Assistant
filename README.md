@@ -70,7 +70,7 @@ Set these variables in .env
 
 ### docker-compose up --build
 
-## First time using it
+## Using the App
 
 1. Go to the sidebar and upload a PDF, DOCX, or HTML file
 2. Wait a few seconds for it to index
