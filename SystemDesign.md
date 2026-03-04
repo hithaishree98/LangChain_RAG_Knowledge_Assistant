@@ -2,7 +2,8 @@
 
 ## High Level Architecture
 
-Two separate services — a FastAPI backend and a Streamlit frontend, talking to each other over HTTP.
+Two separate services, a FastAPI backend and a Streamlit frontend, talking to each other over HTTP.
+
 
 ```
         
@@ -20,37 +21,59 @@ Two separate services — a FastAPI backend and a Streamlit frontend, talking to
                                             │
                           ┌─────────────────┼─────────────────┐
                    
-                      ChromaDB           SQLite           Groq API   
-                     (vectors)         (logs/docs)         (LLM)     
+                      ChromaDB           SQLite             Groq API   
+                     (vectors)    (logs/analytics/audit)      (LLM)     
 
 ```
 
 ## How a document becomes queryable
 
-This is the core of the system and where I spent most of my time getting things right. When you upload a PDF, it goes through a pipeline before it's ready to answer questions.
+This is the core of the system and where I spent most of my time getting things right. When user uploads a PDF, it goes through a pipeline before it's ready to answer questions.
 
 - **Parsing** — the file gets read by the right loader depending on its type. PDFs use PyPDF, Word docs use Docx2txt, HTML uses Unstructured. This gives raw text.
 
-- **Chunking** — the raw text gets split into overlapping chunks. The overlap matters. If a sentence spans the boundary between two chunks and you split it cleanly, you lose context. The overlap means each chunk shares a little content with the next one so nothing important falls through the gap.
+- **Chunking** — the raw text gets split into overlapping chunks. The overlap matters for context. The overlap means each chunk shares a little content with the next one so nothing important falls through the gap.
 
-- **Embedding** — each chunk is converted into a vector (a list of numbers representing its meaning) using the HuggingFace nomic-embed-text-v1.5 model. Two chunks about similar topics will have vectors that are mathematically close to each other. This is what makes semantic search work, we're not matching words, we're matching meaning.
+- **Embedding** — each chunk is converted into a vector (a list of numbers representing its meaning) and HuggingFace nomic-embed-text-v1.5 model is used for this.
+
+  **Why Embedding**
+  Two chunks about similar topics will have vectors that are mathematically close to each other. This is what makes semantic search work, we're not matching words, we're matching meaning.
 
 - **Storing** — the vectors and original chunk text are stored in ChromaDB with metadata like which file they came from, which user uploaded them.
 
-When someone asks a question, it goes through the same embedding step and ChromaDB finds the chunks whose vectors are closest. Those chunks become the context the LLM uses to answer.
+  When someone asks a question, it goes through the same embedding step and ChromaDB finds the chunks whose vectors are closest. Those chunks become the context the LLM uses to answer.
 
+- **History aware retrieval** - users often ask follow-up questions that depend on earlier context.
+
+  Chat history for each session is stored in SQLite. When a new question arrives, the system retrieves the previous messages and passes them into a history-aware retriever. 
+
+  If the question depends on earlier context, the model first rewrites it into a standalone query before performing vector search. This ensures that even short follow-up questions retrieve the correct document context.
+  
 ## System design concepts in this project
 
 - **Client-Server Architecture**
   
-  The frontend and backend are completely separate services. Streamlit handles the UI, FastAPI handles everything else. They communicate over HTTP.
+  The frontend and backend are designed to be completely separate services.
+  Streamlit handles the UI, FastAPI handles the backend logic such as document ingestion, retrieval, and LLM interaction.
+  They communicate thorugh API endpoints.
         
-   Someone could replace the Streamlit frontend with a Slack bot or a Chrome extension without touching a single line of the RAG logic. That separation was intentional from the start.
+   This seperation is intentional as it allows the UI layer and the backend logic to evolve independently.
+
+    For example, the Streamlit frontend could be replaced with another interface such as a Slack bot or a browser extension without changing the RAG pipeline. Similarly, changes to the LLM model or retrieval logic can be made in the backend without affecting the frontend.
 
 - **Data Isolation**
-  
+
+  I did not want to implement a full authentication system at this level for this project, but I still needed a way to isolate user data especially to make sure uploaded documents are not visible to other users.
+
+  Deterministic hashing is used to secure by producing user_id using the workspace name and passkey.
+
+  Same workspace_name + same passkey = same hash
+  Every document chunk stored in ChromaDB and every row written to SQLite is tagged with this `user_id`.
+
+
    Every document chunk and every database row is tagged with a user_id.
-   Chroma filters on user_id at query time. SQLite queries include WHERE user_id = ?.
+
+   Retrieval queries in Chroma filter by `user_id`, and SQLite queries include `WHERE user_id = ?`, ensuring that users can only access their own documents and conversation history.
 
 - **Retrieval Augmented Generation (RAG)**
   
