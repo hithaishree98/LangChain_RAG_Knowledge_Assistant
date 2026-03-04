@@ -19,7 +19,7 @@ That's what this project is. It started as a way for me to deeply learn RAG arch
 - Confidence scoring on every response
 - Bulk mode let's you upload a CSV of questions, get all answers back at once (useful for RFPs or questionnaires)
 - List and delete indexed files per user
-- Slack notifications when check box selected
+- Optional Slack notifications when enabled and a webhook is configured.
 - Full audit log of every query, answer, and confidence score
 - Usage analytics per session
 
