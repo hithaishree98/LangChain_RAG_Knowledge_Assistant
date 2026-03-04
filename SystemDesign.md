@@ -68,18 +68,16 @@ This is the core of the system and where I spent most of my time getting things 
   Deterministic hashing is used to secure by producing user_id using the workspace name and passkey.
 
   Same workspace_name + same passkey = same hash
+
   Every document chunk stored in ChromaDB and every row written to SQLite is tagged with this `user_id`.
-
-
-   Every document chunk and every database row is tagged with a user_id.
 
    Retrieval queries in Chroma filter by `user_id`, and SQLite queries include `WHERE user_id = ?`, ensuring that users can only access their own documents and conversation history.
 
 - **Retrieval Augmented Generation (RAG)**
   
-   RAG stores documents as vectors and retrieves only the relevant chunks at query time.
+   Customer data changes constantly and data changes from one customer to another. Fine tuning a model requires training the model frequently to know everything about your customers which is not feasible.
 
-   Since customer data changes constantly, fine-tuning would require retraining every time anything changes.
+  Hence in this usecase I found RAG as the right approach. Here documents are stored as vectors. At query time, find only the relevant chunks and send those to the LLM. Works with unlimited documents, documents can be added any time, no retraining needed.
 
 - **Vector Similarity Search**
   
