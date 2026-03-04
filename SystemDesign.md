@@ -57,9 +57,9 @@ This is the core of the system and where I spent most of my time getting things 
   Streamlit handles the UI, FastAPI handles the backend logic such as document ingestion, retrieval, and LLM interaction.
   They communicate thorugh API endpoints.
         
-   This seperation is intentional as it allows the UI layer and the backend logic to evolve independently.
+  This seperation is intentional as it allows the UI layer and the backend logic to evolve independently.
 
-    For example, the Streamlit frontend could be replaced with another interface such as a Slack bot or a browser extension without changing the RAG pipeline. Similarly, changes to the LLM model or retrieval logic can be made in the backend without affecting the frontend.
+   For example, the Streamlit frontend could be replaced with another interface such as a Slack bot or a browser extension without changing the RAG pipeline. Similarly, changes to the LLM model or retrieval logic can be made in the backend without affecting the frontend.
 
 - **Multi Tenancy & Data Isolation (Deterministic Hashing)**
 
@@ -73,15 +73,21 @@ This is the core of the system and where I spent most of my time getting things 
 
    Retrieval queries in Chroma filter by `user_id`, and SQLite queries include `WHERE user_id = ?`, ensuring that users can only access their own documents and conversation history.
 
-- **Retrieval Augmented Generation (RAG)**
+- **Retrieval Augmented Generation (RAG) with Vector Similarity Search**
   
    Customer data changes constantly and data changes from one customer to another. Fine tuning a model requires training the model frequently to know everything about your customers which is not feasible.
 
   Hence in this usecase I found RAG as the right approach. Here documents are stored as vectors. At query time, find only the relevant chunks and send those to the LLM. Works with unlimited documents, documents can be added any time, no retraining needed.
 
-- **Vector Similarity Search**
+  Text gets converted into high-dimensional vectors where semantic similarity maps to mathematical closeness. This finds the right chunk even when the question uses different words than the document unlike keyword search would miss it.
+
+- **Data Modelling and Migration**
+
+  The core workflow is that users upload documents and ask questions about them, and the system retrieves relevant document content to generate answers. The system also keeps logs of interactions for auditing and analytics.
   
-  Text gets converted into high-dimensional vectors where semantic similarity maps to mathematical closeness.
+  So main entities the application needs to store include document metadata, interaction logs and document chunks. Structured data is stored in SQLite and embeddings in Chroma.
+  
+  The data isolation requirement was introduced after intial schema creation database migration is used to safely update schema.
 
 - **LLM Determinism — temperature set to zero**
   
@@ -89,64 +95,68 @@ This is the core of the system and where I spent most of my time getting things 
 
   For an FDE using this in front of a customer, answers that randomly vary on every run would completely undermine trust. Hence temperature is set to 0 deliberately to reduce randomness.
 
-- **Prompt and Guardrails**
+- **Prompt Design and Guardrails**
 
-  Prompt is structured as role, context, task, constraints and output.
+  The structure followed in the propmpt is as follows role, context, task, constraints and output.
 
-  The model is strictly instructed to use only retrieved context, never rely on outside knowledge, never fabricate details, and return a fixed fallback sentence when evidence is missing.
+  This reduces hallucination and also model is instructed to answer only using the retrieved document context, avoid relying on outside knowledge, and never fabricate details.
+
+  If the answer cannot be found in the provided context, it returns a fixed fallback response indicating that the information is not available.
   
 - **Fault Tolerance and Degradation**
   
-  Things fail in production like LLMs go down, databases lock, networks timeout.
+  Few point of failures that have been handled to be resilient
 
-   - The system handles each failure independently. 
-     - LLM failures retry with exponential backoff (wait 1s, then 2s, then return 503).
-     - Slack notification failures don't affect the answer.
-     - Database write failures don't corrupt the session.
+     - LLM failures retry with exponential backoff then returns 503.
+     - Slack notification failures logs the error but still continues to give the answer, does not break the system or chat.
+     - Database write failures logs the error but still contiues to give answer to the user.
+     - If Chroma indexing fails after SQLite record creation for the document, then SQLite record is deleted.
+     - In bulk questionnaire mode, if any question triggers failure then it returns an fallback answer " Failed to get answer, return manually" and continues with next question.
 
-- **Idempotency and Atomic Operations**
+- **Validations**
   
-  If document indexing fails halfway through, the database record gets cleaned up.
+  - Request structure validation at API endpoints like /chat and /delete-doc using Pydantic.
+    
+    If the request is missing a field or has the wrong type, the API immediately returns HTTP 422 and stops processing.
 
-  Temp files are deleted in a finally block so they're always cleaned up even if an exception is thrown. 
-
-  Duplicate uploads are rejected with a 409 before any work is done.
-
-- **Input Validation**
-
-  Every request is checked before any work starts. A 200MB file or a 10,000-character question gets rejected immediately with a clear 400 error. 
+  - User question validation to check if the question is empty or too long.
+ 
+    If the question fails these checks, the API returns HTTP 400
   
+  - Document upload validation to check file extension, file not empty, file size.
 
+    If any of these checks fail, the upload is rejected and the API returns HTTP 400.
+
+    Duplicate uploads are rejected based on filename with a 409.
+
+  - Bulk questionnaire uploads validation checks file format, rows and columns.
+ 
+    If any of these checks fail, the API returns HTTP 400.
+
+  - Delete document validation if document not present.
+
+    If no document is found, the API returns HTTP 404.     
+      
 - **Observability**
 
-  - Structured JSON logs for debugging individual requests
-  - business metrics via /analytics for understanding usage patterns
-  - audit trail of every query and response.
+    Application_logs use helper functions in db_utils.py. These logs store session_id, user_id, user_query, gpt_response, model, confidence, escalated, sources.
+
+    /audit-log endpoint shows the raw interaction logs stored in the application_logs table.
+    - This is helpful in debugging user conversations, reviewing past interactions and auditing how the system responded to questions.
+
+    /analytics endpoint shows aggregated information derived from the logs such as total number of chat requests, number of escalations, average confidence score, usage patterns.
+    - This is helful in how the system is being used, how often questions cannot be answered confidently and overall performance of the RAG system.
+ 
+    /logs shows the last N JSON log entries written by StructuredLogger.
+    - This is helful in showing what operational errors happened (retries, failures, endpoint errors)
+      
 
 - **Health check**
-- 
-    To check whether the database, vector store, and LLM key are all working.
+
+    /health endpoint verifies SQLite connectivity, Chroma vector store availability and configuration of required environment variables.
+
+    returns "healthy" if all checks are acceptable, else "degraded"
  
-- **Security**
-  
-  - Input validation blocks malformed requests (max file size, allowed extensions, max question length).
-   - Authentication via API key header.
-   - Authorization via user_id filtering at the database level
-   - LLM guardrail prompt prevents hallucination
- 
-- **Deterministic Hashing**
-  
-  The workspace and passkey get hashed together to produce a consistent user_id.
-
-  Same inputs always produce the same hash. Different passkey produces a completely different hash. 
-
-  This gives persistent workspace identity without a user table, password storage, or session management.
-
-- **Logging**
-  
-  Custom StructuredLogger that writes every event as a single line of JSON. Every API call, LLM retry, upload, deletion, and error gets logged.
-
-  JSON was preferred as it is parseable. We can filter by event type, timestamp, and also answer questions like "how many queries had confidence below 0.4 this week?".
 
 ## Tools used
 - Groq
