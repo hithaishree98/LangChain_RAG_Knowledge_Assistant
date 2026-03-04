@@ -21,7 +21,7 @@ That's what this project is. It started as a way for me to deeply learn RAG arch
 - List and delete indexed files per user
 - Optional Slack notifications when enabled and a webhook is configured.
 - Full audit log of every query, answer, and confidence score
-- Usage analytics per session
+- Usage analytics per user including query counts, escalation rate, and average confidence.
 
 ## How It Works
 ```
