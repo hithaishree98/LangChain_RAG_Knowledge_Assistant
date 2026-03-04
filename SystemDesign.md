@@ -61,7 +61,7 @@ This is the core of the system and where I spent most of my time getting things 
 
     For example, the Streamlit frontend could be replaced with another interface such as a Slack bot or a browser extension without changing the RAG pipeline. Similarly, changes to the LLM model or retrieval logic can be made in the backend without affecting the frontend.
 
-- **Data Isolation**
+- **Data Isolation (Deterministic Hashing)**
 
   I did not want to implement a full authentication system at this level for this project, but I still needed a way to isolate user data especially to make sure uploaded documents are not visible to other users.
 
