@@ -102,6 +102,16 @@ This is the core of the system and where I spent most of my time getting things 
   This reduces hallucination and also model is instructed to answer only using the retrieved document context, avoid relying on outside knowledge, and never fabricate details.
 
   If the answer cannot be found in the provided context, it returns a fixed fallback response indicating that the information is not available.
+
+- **Confidence_Score**
+
+  Currently confidence score of every answer is computed based on how many chunks were retrieved and answer length in characters.
+
+  Answers which have confidence scores less than 0.4 are marked as escalated in application_logs.
+  /analytics aggregates from those logs through which we can determine
+    - average confidence
+    - how often questions are unsupported (low confidence / escalations)
+    - which sessions/users are hitting lots of low-confidence answers
   
 - **Fault Tolerance and Degradation**
   
