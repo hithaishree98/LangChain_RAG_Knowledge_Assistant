@@ -1,11 +1,11 @@
-import requests
+import httpx
 import os
 
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
 
-
-def send_to_slack(question: str, answer: str, sources: list, confidence: float, session_id: str):
-    if not SLACK_WEBHOOK_URL:
+async def send_to_slack(question: str, answer: str, sources: list,
+                        confidence: float, session_id: str) -> bool:
+    webhook_url = os.getenv("SLACK_WEBHOOK_URL", "")   # read at call time, not import time
+    if not webhook_url:
         return False
 
     if confidence > 0.7:
@@ -41,7 +41,8 @@ def send_to_slack(question: str, answer: str, sources: list, confidence: float, 
     }
 
     try:
-        r = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=10)
+        async with httpx.AsyncClient() as client:
+            r = await client.post(webhook_url, json=payload, timeout=10)
         return r.status_code == 200
     except Exception as e:
         print(f"Slack notification failed: {e}")

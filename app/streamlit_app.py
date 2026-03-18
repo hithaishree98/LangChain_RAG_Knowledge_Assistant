@@ -3,6 +3,14 @@ import pandas as pd
 import requests
 import hashlib
 import os
+import html as _html
+
+@st.cache_data(ttl=15)
+def get_health_status():
+    try:
+        return requests.get(f"{API_BASE_URL}/health", timeout=2).json()
+    except Exception:
+        return None
 
 from styles import (
     CSS,
@@ -49,7 +57,13 @@ def api_post(path: str, json: dict = None, files=None, **params):
             files=files,
             timeout=30
         )
-        return r.json() if r.status_code == 200 else r.json()
+        if r.status_code == 200:
+            return r.json()
+        
+        try:
+            return r.json()
+        except Exception:
+            return {"detail": f"HTTP {r.status_code}"}
     except Exception as e:
         return {"detail": str(e)}
 
@@ -107,7 +121,7 @@ st.markdown(f"""
         FDE Assistant
     </div>
     <div style="font-size:12px;color:#55556a;margin-top:2px;">
-        {workspace_label}
+        {_html.escape(workspace_label)}
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -180,11 +194,11 @@ with st.sidebar:
 
     # API health
     st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
-    try:
-        health = requests.get(f"{API_BASE_URL}/health", timeout=2).json()
-        ok     = health.get("status") == "healthy"
+    health = get_health_status()
+    if health:
+        ok = health.get("status") == "healthy"
         color, label = ("#22c55e", "API healthy") if ok else ("#f59e0b", "API degraded")
-    except Exception:
+    else:
         color, label = "#ef4444", "API offline"
 
     st.markdown(health_indicator(color, label), unsafe_allow_html=True)
@@ -208,8 +222,8 @@ with tab1:
         notify_slack = st.checkbox("Send answer to Slack", key="notify_slack")
         if notify_slack:
             try:
-                health   = requests.get(f"{API_BASE_URL}/health", timeout=2).json()
-                slack_ok = health.get("checks", {}).get("slack") == "configured"
+                health   = get_health_status()
+                slack_ok = (health or {}).get("checks", {}).get("slack") == "configured"
                 if slack_ok:
                     st.success("Slack is configured")
                 else:

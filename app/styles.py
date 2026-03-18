@@ -1,3 +1,4 @@
+import html as _html
 FONTS = """
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
 """
@@ -300,7 +301,7 @@ def section_label(text: str) -> str:
     """Simple muted label for sidebar and tab sections."""
     return f"""
     <div style="font-size:11px;color:#55556a;margin-bottom:8px;">
-        {text}
+        {_html.escape(text)}
     </div>
     """
 
@@ -311,7 +312,7 @@ def doc_card(filename: str) -> str:
                 border:1px solid #2a2a3a;border-radius:6px;
                 font-size:12px;color:#e8e8f0;
                 overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
-        {filename}
+        {_html.escape(filename)}
     </div>
     """
 
@@ -376,7 +377,7 @@ def query_row(index: int, text: str) -> str:
                 border:1px solid #2a2a3a;border-radius:6px;
                 font-size:12px;color:#8888aa;display:flex;gap:10px;">
         <span style="color:#3a3a52;min-width:20px;">{index}.</span>
-        <span style="color:#e8e8f0;">{text}</span>
+        <span style="color:#e8e8f0;">{_html.escape(text)}</span>
     </div>
     """
 
@@ -386,6 +387,6 @@ def gap_row(text: str) -> str:
                 background:rgba(239,68,68,0.04);
                 border-left:3px solid #ef4444;border-radius:4px;
                 font-size:12px;color:#8888aa;">
-        {text}
+        {_html.escape(text)}
     </div>
     """

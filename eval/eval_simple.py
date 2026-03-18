@@ -35,16 +35,23 @@ def coverage(answer: str, facts: List[str]) -> float:
             hit += 1
     return hit / max(1, len(facts))
 
-def ask(question: str):
-    payload = {"question": question, "model": MODEL}
-    # No session_id → each Q independent (no history leakage)
-    r = requests.post(API_URL, json=payload, timeout=120)
-    if r.status_code != 200:
-        return {"error": f"http {r.status_code}", "answer": ""}
-    return r.json()
+def ask(question):
+    r = requests.post(
+        "http://localhost:8000/chat",
+        json={"question": question}
+    )
+
+    data = r.json()
+
+    return {
+        "answer": data["answer"],
+        "confidence": data["confidence"],
+        "sources": data["sources"]
+    }
 
 def evaluate(csv_path: str):
-    rows = list(csv.DictReader(open(csv_path, encoding="utf-8-sig")))
+    with open(csv_path, encoding="utf-8-sig") as f:
+        rows = list(csv.DictReader(f))
     sims, covs, lats = [], [], []
     errors = 0
 
@@ -62,15 +69,23 @@ def evaluate(csv_path: str):
             print(f"[{i}] ERROR {resp['error']} | Q: {q}")
             continue
 
-        ans = resp.get("answer","")
+        ans = resp.get("answer", "")
+        conf = resp.get("confidence", 0.0)
+        sources = resp.get("sources", [])
+
         lat = (t1 - t0) * 1000.0
         lats.append(lat)
 
         sim = semantic_sim(ans, ref) if ref else 0.0
         cov = coverage(ans, facts)
 
-        sims.append(sim); covs.append(cov)
-        print(f"[{i}] sim={sim:.2f} cov={cov:.2f} lat={lat:.1f}ms | {q}")
+        sims.append(sim)
+        covs.append(cov)
+
+        print(f"[{i}] sim={sim:.2f} cov={cov:.2f} conf={conf:.2f} lat={lat:.1f}ms")
+        print(f"     sources={sources}")
+        print(f"     Q: {q}")
+        print()
 
     n = len(sims)
     p50 = statistics.median(lats) if lats else 0.0
@@ -85,8 +100,10 @@ def evaluate(csv_path: str):
         "error_rate": round(err_rate, 3),
         "count": n
     }
-    json.dump(out, open(os.path.join(os.path.dirname(csv_path), "metrics_open_simple.json"), "w"), indent=2)
-    print("\n=== SIMPLE OPEN-ENDED METRICS ===")
+    out_path = os.path.join(os.path.dirname(csv_path), "metrics_open_simple.json")
+    with open(out_path, "w") as f:
+        json.dump(out, f, indent=2)
+    print("SIMPLE METRICS")
     print(json.dumps(out, indent=2))
 
 def evaluate_custom(questions: list[dict]):

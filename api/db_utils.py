@@ -58,26 +58,24 @@ def run_migrations():
 def insert_application_logs(session_id, user_query, gpt_response, model,
                              confidence=0.0, escalated=False, sources="",
                              user_id="default"):
-    conn = get_db_connection()
-    conn.execute(
-        """INSERT INTO application_logs
-           (session_id, user_id, user_query, gpt_response, model, confidence, escalated, sources)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (session_id, user_id, user_query, gpt_response, model, confidence, int(escalated), sources)
-    )
-    conn.commit()
-    conn.close()
+    with get_db_connection() as conn:
+        conn.execute(
+            """INSERT INTO application_logs
+            (session_id, user_id, user_query, gpt_response, model, confidence, escalated, sources)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (session_id, user_id, user_query, gpt_response, model, confidence, int(escalated), sources)
+        )
+        conn.commit()
 
 
 def get_chat_history(session_id, user_id="default"):
-    conn = get_db_connection()
-    rows = conn.execute(
+    with get_db_connection() as conn:
+        rows = conn.execute(
         """SELECT user_query, gpt_response FROM application_logs
            WHERE session_id = ? AND user_id = ?
            ORDER BY created_at""",
         (session_id, user_id)
-    ).fetchall()
-    conn.close()
+        ).fetchall()
     messages = []
     for row in rows:
         messages.extend([
@@ -88,67 +86,62 @@ def get_chat_history(session_id, user_id="default"):
 
 
 def insert_document_record(filename, user_id="default"):
-    conn = get_db_connection()
-    cursor = conn.execute(
-        "INSERT INTO document_store (filename, user_id) VALUES (?, ?)",
-        (filename, user_id)
-    )
-    file_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
+    with get_db_connection() as conn:
+        cursor = conn.execute(
+            "INSERT INTO document_store (filename, user_id) VALUES (?, ?)",
+            (filename, user_id)
+        )
+        file_id = cursor.lastrowid
+        conn.commit()
     return file_id
 
 
 def delete_document_record(file_id, user_id="default"):
-    conn = get_db_connection()
-    conn.execute(
-        "DELETE FROM document_store WHERE id = ? AND user_id = ?",
-        (file_id, user_id)
-    )
-    conn.commit()
-    conn.close()
-    return True
+    with get_db_connection() as conn:
+        cursor = conn.execute(
+            "DELETE FROM document_store WHERE id = ? AND user_id = ?",
+            (file_id, user_id)
+        )
+        conn.commit()
+    return cursor.rowcount > 0
 
 
 def get_all_documents(user_id="default"):
-    conn = get_db_connection()
-    rows = conn.execute(
-        """SELECT id, filename, user_id, upload_timestamp FROM document_store
-           WHERE user_id = ? ORDER BY upload_timestamp DESC""",
-        (user_id,)
-    ).fetchall()
-    conn.close()
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            """SELECT id, filename, user_id, upload_timestamp FROM document_store
+               WHERE user_id = ? ORDER BY upload_timestamp DESC""",
+            (user_id,)
+        ).fetchall()
     return [dict(row) for row in rows]
 
 
 def get_query_stats(user_id="default"):
-    conn = get_db_connection()
+    with get_db_connection() as conn:
 
-    total = conn.execute(
-        "SELECT COUNT(*) as n FROM application_logs WHERE user_id = ?", (user_id,)
-    ).fetchone()["n"]
+        total = conn.execute(
+            "SELECT COUNT(*) as n FROM application_logs WHERE user_id = ?", (user_id,)
+        ).fetchone()["n"]
 
-    escalated = conn.execute(
-        "SELECT COUNT(*) as n FROM application_logs WHERE escalated = 1 AND user_id = ?", (user_id,)
-    ).fetchone()["n"]
+        escalated = conn.execute(
+            "SELECT COUNT(*) as n FROM application_logs WHERE escalated = 1 AND user_id = ?", (user_id,)
+        ).fetchone()["n"]
 
-    avg_conf = conn.execute(
-        "SELECT AVG(confidence) as avg FROM application_logs WHERE user_id = ?", (user_id,)
-    ).fetchone()["avg"] or 0.0
+        avg_conf = conn.execute(
+            "SELECT AVG(confidence) as avg FROM application_logs WHERE user_id = ?", (user_id,)
+        ).fetchone()["avg"] or 0.0
 
-    recent = [row["user_query"] for row in conn.execute(
-        "SELECT user_query FROM application_logs WHERE user_id = ? ORDER BY created_at DESC LIMIT 10",
-        (user_id,)
-    ).fetchall()]
+        recent = [row["user_query"] for row in conn.execute(
+            "SELECT user_query FROM application_logs WHERE user_id = ? ORDER BY created_at DESC LIMIT 10",
+            (user_id,)
+        ).fetchall()]
 
-    gaps = [row["user_query"] for row in conn.execute(
-        """SELECT user_query FROM application_logs
-           WHERE escalated = 1 AND user_id = ?
-           ORDER BY created_at DESC LIMIT 10""",
-        (user_id,)
-    ).fetchall()]
-
-    conn.close()
+        gaps = [row["user_query"] for row in conn.execute(
+            """SELECT user_query FROM application_logs
+            WHERE escalated = 1 AND user_id = ?
+            ORDER BY created_at DESC LIMIT 10""",
+            (user_id,)
+        ).fetchall()]
     return {
         "total_queries": total,
         "escalated_count": escalated,
@@ -159,16 +152,15 @@ def get_query_stats(user_id="default"):
 
 
 def get_audit_log(user_id="default", limit=100):
-    conn = get_db_connection()
-    rows = conn.execute(
-        """SELECT session_id, user_query, gpt_response, model,
-                  confidence, escalated, sources, created_at
-           FROM application_logs
-           WHERE user_id = ?
-           ORDER BY created_at DESC LIMIT ?""",
-        (user_id, limit)
-    ).fetchall()
-    conn.close()
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            """SELECT session_id, user_query, gpt_response, model,
+                    confidence, escalated, sources, created_at
+            FROM application_logs
+            WHERE user_id = ?
+            ORDER BY created_at DESC LIMIT ?""",
+            (user_id, limit)
+        ).fetchall()
     return [dict(row) for row in rows]
 
 
@@ -177,4 +169,3 @@ def generate_user_id(workspace: str, passkey: str) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
 
-run_migrations()

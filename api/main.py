@@ -1,3 +1,5 @@
+import asyncio
+
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, status, Request
 from fastapi.responses import JSONResponse
 from fastapi.security.api_key import APIKeyHeader
@@ -11,9 +13,9 @@ from db_utils import (
     get_query_stats, get_audit_log
 )
 from notification_utils import send_to_slack
-import os, uuid, time, csv, io, json, logging
+import os, uuid, time, csv, io, json, logging, tempfile
 from datetime import datetime, timezone
-
+from db_utils import run_migrations
 
 # Simple structured logger that writes JSON to file and plain text to console
 class StructuredLogger:
@@ -53,18 +55,20 @@ log = StructuredLogger("rag_api")
 
 app = FastAPI(title="FDE Assistant API")
 
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:8501").split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"]
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "X-API-Key"],
 )
 
 CONFIDENCE_THRESHOLD = 0.4
 MAX_QUESTION_LENGTH = 1000
 MAX_FILE_SIZE_MB = 10
 ALLOWED_EXTENSIONS = [".pdf", ".docx", ".html"]
-MAX_RETRIES = 2
+MAX_RETRIES = 3
 
 API_KEY_NAME = "X-API-Key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
@@ -112,7 +116,7 @@ def health_check():
 
 
 @app.post("/chat", response_model=QueryResponse, dependencies=[Depends(verify_api_key)])
-def chat(query_input: QueryInput):
+async def chat(query_input: QueryInput):
     user_id = query_input.user_id
     question = query_input.question.strip()
 
@@ -143,13 +147,13 @@ def chat(query_input: QueryInput):
             retriever = get_retriever_for_user(user_id)
             rag_chain = get_rag_chain(query_input.model.value, retriever=retriever)
             chat_history = get_chat_history(session_id, user_id=user_id)
-            result = rag_chain.invoke({"input": question, "chat_history": chat_history})
+            result = await rag_chain.ainvoke({"input": question, "chat_history": chat_history})
             break
         except Exception as e:
             last_error = e
             log.warning("llm_retry", session_id=session_id, attempt=attempt + 1, error=str(e))
             if attempt < MAX_RETRIES - 1:
-                time.sleep(2 ** attempt)
+                await asyncio.sleep(2 ** attempt)
     else:
         log.error("llm_failed", session_id=session_id, error=str(last_error))
         raise HTTPException(status_code=503,
@@ -171,7 +175,7 @@ def chat(query_input: QueryInput):
 
     if query_input.notify_slack:
         try:
-            send_to_slack(question, answer, sources, confidence, session_id)
+            await send_to_slack(question, answer, sources, confidence, session_id)
         except Exception as e:
             log.error("slack_failed", session_id=session_id, error=str(e))
 
@@ -209,11 +213,14 @@ async def upload_and_index_document(file: UploadFile = File(...), user_id: str =
         raise HTTPException(status_code=409,
             detail=f"'{file.filename}' already exists. Delete it first or rename the file.")
 
-    temp_path = f"temp_{uuid.uuid4()}_{file.filename}"
+    safe_name = os.path.basename(file.filename)
+    suffix = os.path.splitext(safe_name)[1]
+    tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    temp_path = tmp.name
 
     try:
-        with open(temp_path, "wb") as f:
-            f.write(contents)
+        tmp.write(contents)
+        tmp.close()
 
         log.info("upload_started", filename=file.filename, size_mb=round(size_mb, 2))
 
@@ -266,7 +273,7 @@ def delete_document(request: DeleteFileRequest):
         raise HTTPException(status_code=500, detail="Failed to delete document.")
 
 
-@app.get("/analytics")
+@app.get("/analytics", dependencies=[Depends(verify_api_key)])
 def get_analytics(user_id: str = "default"):
     try:
         return get_query_stats(user_id=user_id)
@@ -275,7 +282,7 @@ def get_analytics(user_id: str = "default"):
         raise HTTPException(status_code=500, detail="Failed to load analytics.")
 
 
-@app.get("/audit-log")
+@app.get("/audit-log", dependencies=[Depends(verify_api_key)])
 def audit_log(limit: int = 100, user_id: str = "default"):
     try:
         return get_audit_log(user_id=user_id, limit=limit)
@@ -284,7 +291,7 @@ def audit_log(limit: int = 100, user_id: str = "default"):
         raise HTTPException(status_code=500, detail="Failed to load audit log.")
 
 
-@app.get("/logs")
+@app.get("/logs", dependencies=[Depends(verify_api_key)])
 def get_logs(level: str = None, limit: int = 100):
     log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "app.log")
     if not os.path.exists(log_path):
@@ -336,7 +343,7 @@ async def answer_questionnaire(file: UploadFile = File(...), user_id: str = "def
         if not question:
             continue
         try:
-            result = rag_chain.invoke({"input": question, "chat_history": []})
+            result = await rag_chain.ainvoke({"input": question, "chat_history": []})
             answer = result["answer"]
             retrieved = result.get("context", [])
             confidence = calculate_confidence(answer, retrieved)
@@ -365,3 +372,7 @@ async def answer_questionnaire(file: UploadFile = File(...), user_id: str = "def
         "total": len(results),
         "needs_review_count": sum(1 for r in results if r["needs_review"])
     }
+
+    @app.on_event("startup")
+    def on_startup():
+        run_migrations()

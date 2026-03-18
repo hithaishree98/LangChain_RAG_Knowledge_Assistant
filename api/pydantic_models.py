@@ -13,7 +13,6 @@ class QueryInput(BaseModel):
     session_id: Optional[str] = None
     model: ModelName = ModelName.GROQ_DEFAULT
     notify_slack: bool = False
-    notify_email: Optional[str] = None
     user_id: str = "default"
 
 
