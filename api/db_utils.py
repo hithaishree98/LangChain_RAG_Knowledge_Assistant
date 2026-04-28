@@ -1,7 +1,9 @@
 import sqlite3
 import os
-import hashlib
 import glob
+import logging
+
+_log = logging.getLogger(__name__)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
@@ -13,6 +15,8 @@ MIGRATIONS_DIR = os.path.join(BASE_DIR, "migrations")
 def get_db_connection():
     conn = sqlite3.connect(DB_NAME)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 
@@ -39,7 +43,7 @@ def run_migrations():
         if already_run:
             continue
 
-        print(f"[db] Applying {filename}")
+        _log.info("applying_migration filename=%s", filename)
         try:
             with open(filepath) as f:
                 conn.executescript(f.read())
@@ -51,7 +55,7 @@ def run_migrations():
             raise RuntimeError(f"Migration {filename} failed: {e}")
 
     if applied:
-        print(f"[db] {applied} migration(s) applied")
+        _log.info("migrations_applied count=%d", applied)
     conn.close()
 
 
@@ -66,23 +70,6 @@ def insert_application_logs(session_id, user_query, gpt_response, model,
             (session_id, user_id, user_query, gpt_response, model, confidence, int(escalated), sources)
         )
         conn.commit()
-
-
-def get_chat_history(session_id, user_id="default"):
-    with get_db_connection() as conn:
-        rows = conn.execute(
-        """SELECT user_query, gpt_response FROM application_logs
-           WHERE session_id = ? AND user_id = ?
-           ORDER BY created_at""",
-        (session_id, user_id)
-        ).fetchall()
-    messages = []
-    for row in rows:
-        messages.extend([
-            {"role": "human", "content": row["user_query"]},
-            {"role": "ai", "content": row["gpt_response"]}
-        ])
-    return messages
 
 
 def insert_document_record(filename, user_id="default"):
@@ -106,7 +93,22 @@ def delete_document_record(file_id, user_id="default"):
     return cursor.rowcount > 0
 
 
+def _require_user_id(user_id, fn_name: str):
+    """Guard against accidental None passthrough in multi-tenant code paths.
+
+    Previously these functions defaulted to "default" when called with None,
+    which silently returned another tenant's data. Callers must now pass a
+    real workspace id; None or empty string raises to surface the bug early.
+    """
+    if not user_id:
+        raise ValueError(
+            f"{fn_name}: user_id must be a non-empty string "
+            f"(got {user_id!r}). Pass the workspace id explicitly."
+        )
+
+
 def get_all_documents(user_id="default"):
+    _require_user_id(user_id, "get_all_documents")
     with get_db_connection() as conn:
         rows = conn.execute(
             """SELECT id, filename, user_id, upload_timestamp FROM document_store
@@ -117,6 +119,7 @@ def get_all_documents(user_id="default"):
 
 
 def get_query_stats(user_id="default"):
+    _require_user_id(user_id, "get_query_stats")
     with get_db_connection() as conn:
 
         total = conn.execute(
@@ -164,8 +167,15 @@ def get_audit_log(user_id="default", limit=100):
     return [dict(row) for row in rows]
 
 
-def generate_user_id(workspace: str, passkey: str) -> str:
-    raw = f"{workspace.strip().lower()}:{passkey.strip()}"
-    return hashlib.sha256(raw.encode()).hexdigest()[:32]
+def insert_brief_log(customer_id: str, query: str, brief_json: str,
+                     faithfulness_score: float = 0.0, loop_count: int = 0):
+    with get_db_connection() as conn:
+        conn.execute(
+            """INSERT INTO brief_logs (customer_id, query, brief_json, faithfulness_score, loop_count)
+               VALUES (?, ?, ?, ?, ?)""",
+            (customer_id, query, brief_json, faithfulness_score, loop_count),
+        )
+        conn.commit()
+
 
 

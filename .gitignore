@@ -1,5 +1,24 @@
 .env
 __pycache__/
 *.pyc
+*.pyo
+.pytest_cache/
 api/chroma_db/
 api/data/
+
+# Virtualenvs — never commit
+venv/
+venv_rag/
+.venv/
+env/
+
+# Build artifacts and tarballs
+*.tar.gz
+experiment_kit/eval_results/
+experiment_kit/__pycache__/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

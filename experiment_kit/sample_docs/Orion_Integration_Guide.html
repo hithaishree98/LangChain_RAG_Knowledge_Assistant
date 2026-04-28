@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Orion Integration Guide — Meridian Financial</title>
+<style>
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+       max-width: 800px; margin: 2em auto; color: #333; line-height: 1.6; }
+h1 { color: #1a365d; border-bottom: 2px solid #2d4a7c; padding-bottom: 0.3em; }
+h2 { color: #2d4a7c; margin-top: 1.8em; }
+h3 { color: #4a6ea9; margin-top: 1.4em; }
+code { background: #f4f4f8; padding: 2px 5px; border-radius: 3px; font-size: 0.9em; }
+pre { background: #f4f4f8; padding: 1em; border-radius: 5px; overflow-x: auto; }
+.note { background: #fff4d6; border-left: 4px solid #e0a800; padding: 0.8em; margin: 1em 0; }
+.warn { background: #ffe0e0; border-left: 4px solid #c92a2a; padding: 0.8em; margin: 1em 0; }
+table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+th, td { border: 1px solid #ccc; padding: 8px 12px; text-align: left; }
+th { background: #f0f4f8; }
+</style>
+</head>
+<body>
+
+<h1>Orion Integration Guide — Meridian Financial</h1>
+<p><em>Last updated: 2024-09-05 by David Park (FDE). Internal wiki export.</em></p>
+
+<p>This guide is the operational reference for the Meridian Financial deployment of Orion Analytics.
+It is intended for Meridian's data platform team and Orion FDEs. For the master contract
+see the SOW (document ID ORN-MSA-2024-0871).</p>
+
+<h2>1. Environment Overview</h2>
+
+<h3>1.1 Tenant Details</h3>
+<table>
+<tr><th>Attribute</th><th>Value</th></tr>
+<tr><td>Tenant ID</td><td><code>tenant_meridian_prod</code></td></tr>
+<tr><td>Region</td><td>us-east-2 (primary), us-west-2 (DR)</td></tr>
+<tr><td>Control plane URL</td><td><code>https://admin.orion.io/t/meridian</code></td></tr>
+<tr><td>API base URL</td><td><code>https://api.orion.io/v2/meridian</code></td></tr>
+<tr><td>SSO endpoint</td><td><code>https://sso.meridian.com/orion/saml</code></td></tr>
+</table>
+
+<h3>1.2 Environments</h3>
+<p>Three environments are provisioned:</p>
+<ul>
+<li><strong>prod</strong> — production tenant. All customer-facing data.</li>
+<li><strong>staging</strong> — mirrors prod, receives a 1% sample of events. Refreshed weekly.</li>
+<li><strong>dev</strong> — synthetic data only. No PII under any circumstances.</li>
+</ul>
+
+<div class="warn">
+<strong>Important:</strong> Do not copy production data into dev. Use the synthetic dataset generator
+at <code>orion-cli seed --env dev --profile meridian-synthetic</code>.
+</div>
+
+<h3>1.3 Network and Firewall Requirements</h3>
+<p>Meridian's internal network must allow outbound HTTPS (TCP 443) to the following Orion IP ranges: 52.14.0.0/16 (us-east-2 primary), 54.68.0.0/16 (us-west-2 DR), and 13.35.0.0/16 (CloudFront distribution used for the admin console and documentation assets). Inbound webhook delivery from Orion to Meridian's internal systems does not require firewall changes because all webhooks originate from the Orion NAT gateway pool (52.14.112.0/24). If Meridian's network team needs to allowlist by hostname rather than IP, the canonical hostnames are api.orion.io, admin.orion.io, and webhook.orion.io. IP addresses behind these hostnames are stable but may change with 30 days notice; IP-based allowlisting is therefore discouraged in favor of hostname-based rules.</p>
+
+<h2>2. Retrieval Configuration</h2>
+
+<h3>2.1 Default Settings</h3>
+<p>The retrieval subsystem uses the following defaults for Meridian's tenant. These were selected
+after the August 2024 tuning session with Mike Rodriguez's team:</p>
+
+<pre>
+retrieval:
+  top_k: 2
+  chunk_size: 1000
+  chunk_overlap: 200
+  embedding_model: nomic-ai/nomic-embed-text-v1.5
+  hybrid_search: true
+  reranker: disabled
+  query_timeout_ms: 8000
+</pre>
+
+<p>The <code>k=2</code> default was a deliberate choice after benchmarking against Meridian's
+question set — higher k values introduced more noise than signal for their document corpus, which
+leans heavily on short regulatory memos. Customers with longer-form documents typically benefit
+from <code>k=4</code> or <code>k=5</code>.</p>
+
+<h3>2.2 Enabling the Reranker</h3>
+<p>The reranker is available on the Enterprise tier (included in Meridian's contract)
+but disabled by default to minimize latency. To enable:</p>
+<pre>
+orion-cli config set --tenant meridian --key retrieval.reranker --value cross-encoder
+</pre>
+<p>Expect a +180ms p95 latency impact and a measured +12% improvement in recall@5 based on
+the September benchmark.</p>
+
+<h3>2.3 Overriding k Per Query</h3>
+<p>The API supports per-query overrides via the <code>retrieval_k</code> parameter:</p>
+<pre>
+POST /v2/meridian/query
+{
+  "question": "What is the refund policy for delinquent accounts?",
+  "retrieval_k": 5
+}
+</pre>
+
+<h3>2.4 Retrieval Performance Benchmarks</h3>
+<p>The following benchmarks were collected during the August 2024 tuning session using Meridian's production document corpus (47 documents, 312 MB total). All measurements are p95 wall-clock latency from API receipt to response, measured from the Grafana APM dashboard at the us-east-2 control plane. The benchmark query set consists of 50 representative queries drawn from Meridian's regulatory reporting workflow and submitted sequentially with a 2-second inter-query interval to avoid rate limiting.</p>
+
+<table>
+<tr><th>Configuration</th><th>p50 latency</th><th>p95 latency</th><th>recall@5</th><th>MRR</th></tr>
+<tr><td>dense only, k=2</td><td>420ms</td><td>680ms</td><td>0.61</td><td>0.55</td></tr>
+<tr><td>dense+BM25, k=2</td><td>480ms</td><td>740ms</td><td>0.72</td><td>0.66</td></tr>
+<tr><td>dense+BM25+reranker, k=2</td><td>590ms</td><td>920ms</td><td>0.84</td><td>0.79</td></tr>
+<tr><td>dense+BM25+reranker, k=5</td><td>620ms</td><td>980ms</td><td>0.89</td><td>0.83</td></tr>
+</table>
+
+<p>The hybrid search configuration (dense+BM25) is the current production default and provides the best latency-to-quality tradeoff for Meridian's corpus. The reranker is recommended for regulatory reporting queries where recall is more important than latency — a missed relevant document in a compliance context has material risk. The k=5 reranker configuration is the recommended setting for Meridian's UK subsidiary launch, since the UK document corpus will introduce additional regulatory documents that benefit from higher recall depth.</p>
+
+<h2>3. Authentication and API Access</h2>
+
+<h3>3.1 SSO Setup</h3>
+<p>SAML 2.0 SSO is configured with Meridian's Okta tenant. The following attributes
+are mapped on login:</p>
+<ul>
+<li><code>NameID</code> → Orion user identifier</li>
+<li><code>email</code> → primary contact</li>
+<li><code>groups</code> → Orion role (admin, analyst, viewer)</li>
+</ul>
+
+<h3>3.2 Service Accounts</h3>
+<p>Two service accounts are provisioned for machine-to-machine integration:</p>
+<ul>
+<li><code>svc-meridian-etl</code> — used by the nightly batch ingestion from the internal ledger</li>
+<li><code>svc-meridian-sfdc</code> — used by the Salesforce connector</li>
+</ul>
+
+<p>Service account credentials rotate every 90 days. The next rotation is scheduled for 2024-11-18.</p>
+
+<h3>3.3 API Key Management</h3>
+<p>Every API request must include an <code>X-API-Key</code> header containing a valid API key generated from the Orion admin console under Settings &gt; API Keys. Keys are scoped to the tenant and optionally restricted to read-only or read-write permission levels. Keys do not expire automatically but must be rotated quarterly per Orion's security policy and SOW Section 6.3. To rotate a key, follow these five steps in order: (1) generate a new key in the admin console under Settings &gt; API Keys &gt; Create Key, (2) update the new key in all client configurations and environment variables before revoking the old one, (3) verify connectivity by calling the <code>/v2/health</code> endpoint with the new key and confirming a 200 response, (4) revoke the old key from the admin console under Settings &gt; API Keys &gt; Revoke, (5) confirm the revocation event appears in the audit log under Audit &gt; API Key Events. If an invalid or revoked key is presented, the API returns HTTP 401 with the error body <code>{"error": "invalid_api_key"}</code>.</p>
+
+<h3>3.4 Rate Limits</h3>
+<table>
+<tr><th>Tier</th><th>Requests / min</th><th>Burst Allowance</th><th>Concurrent Connections</th></tr>
+<tr><td>Starter</td><td>100</td><td>150</td><td>5</td></tr>
+<tr><td>Growth</td><td>500</td><td>750</td><td>20</td></tr>
+<tr><td>Enterprise</td><td>2,000</td><td>3,000</td><td>100</td></tr>
+</table>
+
+<p>Each API call counts as one request regardless of payload size. Batch endpoints count as one request per item in the batch. Health check endpoints (<code>/v2/health</code>, <code>/v2/ping</code>) are exempt from rate limit accounting. The burst allowance permits short spikes above the per-minute limit and resets every 10 seconds.</p>
+
+<p>When a client exceeds the rate limit, the API returns HTTP 429 with a <code>Retry-After</code> header indicating the number of seconds until the limit resets. The reset window is 60 seconds from the first request in the current window. Clients must implement exponential backoff starting at the value specified in the <code>Retry-After</code> header — do not retry immediately. Persistent rate limit violations from a single key are flagged for review and may result in temporary key suspension.</p>
+
+<h3>3.5 Session Management and JWT Tokens</h3>
+<p>The Orion admin console issues short-lived JWT tokens upon successful SSO authentication. Tokens expire after 30 minutes of inactivity. When a token expires, the user is automatically redirected to Meridian's Okta SSO endpoint for silent re-authentication. If silent re-authentication fails (for example, if the Okta session has also expired), the user is presented with the Okta login screen. Session tokens are signed with RS256 using a 2048-bit RSA key pair. The public key is available at <code>https://admin.orion.io/.well-known/jwks.json</code> for validation by Meridian's internal systems. Service account tokens do not expire on inactivity but are rotated on the 90-day schedule described in Section 3.2. Any token presented to the API after its expiry timestamp returns HTTP 401 with <code>{"error": "token_expired"}</code>.</p>
+
+<h2>4. Data Ingestion</h2>
+
+<h3>4.1 Plaid Integration</h3>
+<p>Plaid transaction events flow via webhook to the Orion ingestion endpoint.
+The current Plaid schema version is <code>v3.2.1</code>. Plaid has announced
+deprecation of v3.2.1 in Q2 2025 in favor of v4.0. All tenants must complete migration before the deprecation date or event ingestion will fail silently.</p>
+
+<p>Migrating from Plaid schema v3.2.1 to v4.0 requires the following five steps completed in order: (1) update the Plaid webhook destination URL in the Plaid developer dashboard to use the v4 endpoint (<code>/v2/meridian/ingest/plaid/v4</code>), (2) update the Orion event schema mapping in the admin console under Integrations &gt; Plaid &gt; Schema Version, (3) send a synthetic test event using the Plaid sandbox and confirm it appears in the Orion event log without errors, (4) monitor the <code>plaid_schema_errors</code> metric in the Orion Grafana dashboard for 24 hours to confirm zero schema validation failures, (5) notify your Orion FDE that migration is complete so they can disable the v3.2.1 compatibility shim on Orion's side.</p>
+
+<div class="note">
+Orion's v4.0 connector support is targeted for Q1 2025.
+Meridian has requested beta access — see TICK-4702.
+</div>
+
+<h3>4.2 Stripe Integration</h3>
+<p>Stripe payment events are pulled via the Stripe API using API version 2024-04-10.
+The integration runs on a 30-second polling interval with idempotency guaranteed via event ID.</p>
+
+<h3>4.3 Internal Ledger Batch</h3>
+<p>A nightly SFTP drop at 02:00 ET delivers the pipe-delimited ledger export.
+File naming convention: <code>meridian_ledger_YYYYMMDD.pipe.gz</code>.
+Typical file size: 2.4-3.8 GB compressed.</p>
+
+<h3>4.4 Webhook Delivery and Retry Policy</h3>
+<p>All Orion-sourced webhooks — including billing event notifications, ingestion status callbacks, and alert webhooks — use the following delivery and retry protocol. The initial delivery attempt is made within 10 seconds of the triggering event. If the receiving endpoint returns a non-2xx response or fails to respond within 30 seconds, Orion's webhook dispatcher marks the delivery as failed and schedules a retry. Retries follow an exponential backoff schedule: first retry at T+5 minutes, second retry at T+15 minutes, third retry at T+45 minutes, fourth retry at T+2 hours. After four failed retries the delivery is abandoned and a delivery-failure alert is posted to the #orion-alerts Slack channel. The triggering event is not lost — it is stored in the webhook event log accessible via the admin console under Integrations > Webhook Log and via the API at <code>GET /v2/meridian/webhooks/events</code>. Meridian can replay any failed webhook manually from this log for up to 30 days after the original trigger. Idempotency on the receiving end is Meridian's responsibility: Orion guarantees at-least-once delivery, not exactly-once. Meridian's receiving systems should key idempotency on the <code>orion_event_id</code> field present in every webhook payload.</p>
+
+<h3>4.5 Ingestion Monitoring</h3>
+<p>The ingestion pipeline exposes the following metrics in the Orion Grafana dashboard under the Meridian > Ingestion panel. Current event throughput (events per second, 1-minute average) is shown as <code>ingest_events_per_second</code>. The monthly cumulative ingestion counter is shown as <code>ingest_monthly_total</code> and updates every 15 minutes; Meridian's contracted limit of 200 million events per month is shown as a red threshold line. When the monthly counter reaches 85% of the contracted limit (170 million events), an automated alert is sent to the Meridian account owner (David Park) and to the primary technical contact (Mike Rodriguez). At 95% (190 million events), a second alert is sent with an estimated date of overage based on the trailing 7-day average daily ingestion rate. Overage events are billed at $0.08 per 10,000 events and appear as a line item on the following month's invoice. As of September 2024, Meridian is ingesting approximately 142 million events per month, leaving 29% headroom before overage applies.</p>
+
+<h2>5. Downstream Integrations</h2>
+
+<h3>5.1 Salesforce Connector (v2.4.1)</h3>
+<p>Scored segments and customer 360 snapshots flow to the Salesforce
+<code>Customer_360</code> object via the Orion-Salesforce connector, version 2.4.1.</p>
+
+<div class="warn">
+<strong>Known limit:</strong> v2.4.1 caps bulk updates at 50,000 records/hour.
+Meridian's current volume is ~12,000/hour — well within spec, but trending upward.
+Monitor via the <code>sfdc_bulk_throughput</code> dashboard.
+</div>
+
+<h3>5.2 Snowflake Warehouse</h3>
+<p>Hourly export lands in the Snowflake external stage
+<code>EXTERNAL_STAGE:ORION_EXPORT</code> as Parquet files partitioned by hour.
+Retention: 30 days in the external stage, indefinite in Meridian's downstream
+curated zone.</p>
+
+<h3>5.3 Slack Alerts</h3>
+<p>P0 and P1 incidents post to <code>#orion-alerts</code>. P2+ incidents
+are summarized in a daily digest to the same channel at 09:00 ET.</p>
+
+<h3>5.4 Salesforce Connector Upgrade Path</h3>
+<p>The v3.x Salesforce connector, which removes the bulk update rate limit entirely by switching to Salesforce's Bulk API 2.0, is targeted for general availability in Q1 2025. The migration from v2.4.1 to v3.x is a configuration-only change and does not require a maintenance window. To upgrade: navigate to Integrations > Salesforce > Connector Version in the admin console, select v3.x, review the field mapping diff presented by the console (there are three field name changes in v3.x — see the migration guide in the admin console for the full list), confirm the mapping, and click Activate. The connector will switch to the new version on the next scheduled sync cycle (within 1 hour). Monitor the <code>sfdc_bulk_throughput</code> and <code>sfdc_sync_errors</code> dashboards for the first 24 hours after migration. If sync errors increase above the baseline, roll back via the same console by selecting v2.4.1 and clicking Activate. David Park recommends planning the v3.x migration alongside the planned seat expansion in Q1 2025 to ensure the connector can handle the increased data volume from additional analyst activity.</p>
+
+<h2>6. Operational Runbooks</h2>
+
+<h3>6.1 If Login Latency Spikes</h3>
+<ol>
+<li>Check the <code>auth_p95_latency</code> dashboard (Grafana > Orion > Meridian > Auth).</li>
+<li>If p95 > 1500ms for more than 5 minutes, open a P1 ticket.</li>
+<li>Workaround for analysts: clear browser cache, use incognito mode.</li>
+<li>Historical reference: TICK-4521 (load balancer sticky-session issue, Sept 2024).</li>
+</ol>
+
+<h3>6.2 If Snowflake Export Is Delayed</h3>
+<ol>
+<li>Check the hourly export dashboard. Expected lag: under 8 minutes.</li>
+<li>Lag over 30 minutes: check the Snowflake warehouse status.</li>
+<li>Lag over 60 minutes: escalate to the Orion FDE (David Park).</li>
+</ol>
+
+<h3>6.3 Emergency Rollback</h3>
+<p>If a configuration change causes widespread issues, roll back via:</p>
+<pre>
+orion-cli config rollback --tenant meridian --to-revision previous
+</pre>
+
+<h3>6.4 Scheduled Maintenance Window Procedure</h3>
+<p>Orion's standard maintenance window for Meridian's tenant is Sunday 02:00-04:00 UTC (Saturday evening US time). During this window, the following may be performed without customer notification: configuration parameter changes, index rebuilds for newly ingested documents, certificate rotations, and non-breaking dependency updates. Changes that require API downtime or that modify the data schema must be communicated to Mike Rodriguez and David Park at least 5 business days in advance via email and must be confirmed in the change management ticket system. Emergency changes outside the maintenance window require P0 or P1 ticket classification, documented approval from the on-call VP Engineering, and notification to Meridian's primary contact within 30 minutes of the change start. Post-maintenance validation steps: (1) run <code>GET /v2/health</code> and confirm 200; (2) verify auth p95 latency is below 1,000ms on the Grafana dashboard; (3) submit a test query from the admin console and confirm a valid response; (4) check the Snowflake export lag dashboard and confirm the most recent export is within 8 minutes of schedule; (5) post a maintenance completion notice to #orion-alerts in Slack with the change summary and validation results.</p>
+
+<h3>6.5 Latency SLA Breach Playbook</h3>
+<p>If any Orion endpoint exceeds its SLA latency threshold for more than 5 consecutive minutes, the following steps should be executed in order. First, check the Grafana SLA dashboard (Orion > Meridian > SLA Overview) to confirm the breach is real and not a monitoring artifact — spikes shorter than 5 minutes do not trigger the SLA credit calculation. Second, identify which endpoint is breaching: auth p95 threshold is 1,000ms, query p95 threshold is 5,000ms, ingestion p95 threshold is 3,000ms. Third, open a P1 ticket immediately with the affected endpoint, breach duration, and observed latency. The on-call engineer must acknowledge within 2 hours per SLA Section 2.2. Fourth, notify the Meridian primary contact (Mike Rodriguez) by email and Slack DM with the ticket number and an estimated resolution time. Fifth, if the breach persists past 4 hours without a resolution ETA from the on-call engineer, escalate to the Orion team lead. If unresolved at 8 hours, the ticket auto-escalates to VP Engineering. At 24 hours the account executive (Elena Martinez) is engaged to manage the customer relationship. Credits accrue per SOW Section 2.3 and are applied to the following invoice automatically — no manual credit request is required from Meridian.</p>
+
+<h3>6.6 Audit Log Review Procedure</h3>
+<p>Meridian's audit log is accessible to users with the admin-role permission via the admin console under Audit > Event Log, or programmatically via <code>GET /v2/audit</code> with an admin-scoped API key. The log retains all events for 7 years in immutable storage and cannot be modified or deleted. For compliance reviews, export the relevant date range as CSV from the admin console (Audit > Export > CSV) or as JSON via the API. When conducting a scheduled quarterly compliance review, the recommended procedure is: (1) export the previous quarter's events filtered by event_type=admin_action and event_type=data_export; (2) cross-reference with the change management ticket system to confirm all admin actions have corresponding approved tickets; (3) verify no data export events occurred outside of approved export windows; (4) confirm all API key creation events have a matching ticket in the key rotation log; (5) submit the export file to Meridian's compliance team with the audit period, event count, and any anomalies noted. Anomalies should be reported to David Park within 24 hours of discovery.</p>
+
+<h2>7. Glossary</h2>
+<dl>
+<dt>FDE</dt><dd>Forward Deployed Engineer — the Orion engineer assigned to Meridian.</dd>
+<dt>QBR</dt><dd>Quarterly Business Review.</dd>
+<dt>RPO</dt><dd>Recovery Point Objective — maximum acceptable data loss window.</dd>
+<dt>RTO</dt><dd>Recovery Time Objective — maximum acceptable downtime for recovery.</dd>
+<dt>Sticky session</dt><dd>Load balancer feature that pins a user to a specific backend node for their session duration.</dd>
+<dt>BM25</dt><dd>Best Match 25 — a probabilistic lexical ranking algorithm used alongside dense embeddings in Orion's hybrid search.</dd>
+<dt>RRF</dt><dd>Reciprocal Rank Fusion — the merging algorithm that combines dense and BM25 result sets into a single ranked list.</dd>
+<dt>Cross-encoder reranker</dt><dd>A second-stage retrieval model that scores each candidate chunk against the query jointly, improving precision at the cost of additional latency.</dd>
+<dt>Parent-child indexing</dt><dd>A retrieval strategy where small child chunks are searched for embedding similarity but their larger parent chunks are returned as context, balancing search precision with answer completeness.</dd>
+</dl>
+
+<h2>8. Troubleshooting Reference</h2>
+
+<h3>8.1 Common Error Codes</h3>
+<table>
+<tr><th>HTTP Status</th><th>Error Code</th><th>Meaning</th><th>Resolution</th></tr>
+<tr><td>401</td><td>invalid_api_key</td><td>Key missing, revoked, or malformed</td><td>Regenerate key; see Section 3.3</td></tr>
+<tr><td>401</td><td>token_expired</td><td>JWT session token past expiry</td><td>Re-authenticate via SSO</td></tr>
+<tr><td>429</td><td>rate_limit_exceeded</td><td>Request rate above tier limit</td><td>Implement backoff; see Retry-After header</td></tr>
+<tr><td>413</td><td>payload_too_large</td><td>Request body exceeds 10 MB limit</td><td>Split batch or reduce payload size</td></tr>
+<tr><td>503</td><td>retrieval_unavailable</td><td>Chroma index temporarily unreachable</td><td>Retry after 30s; open P1 if persistent</td></tr>
+<tr><td>504</td><td>query_timeout</td><td>Query exceeded 8-second timeout</td><td>Reduce retrieval_k or simplify query</td></tr>
+</table>
+
+<h3>8.2 Ingestion Failures</h3>
+<p>If documents uploaded via <code>POST /v2/meridian/ingest</code> do not appear in the document list within 5 minutes, check the ingestion status endpoint at <code>GET /v2/meridian/ingest/{job_id}/status</code>. Common failure reasons include: unsupported file format (supported: PDF, DOCX, HTML, TXT, JSON), file size exceeding 50 MB, malformed PDF (no extractable text layer — scanned PDFs require OCR pre-processing before ingestion), and character encoding errors in plain-text files (UTF-8 is required). If the status endpoint returns <code>{"status": "failed", "reason": "extraction_error"}</code>, the file content could not be extracted. For scanned PDFs, use <code>orion-cli preprocess --ocr input.pdf output.pdf</code> before re-ingesting.</p>
+
+<h3>8.3 Snowflake Export Troubleshooting</h3>
+<p>If the Snowflake external stage is not receiving new Parquet files on the expected hourly schedule, verify the following in order. First, check that the Snowflake warehouse <code>ORION_WH</code> is running and not suspended — a suspended warehouse causes the COPY INTO command to queue indefinitely. Second, verify the external stage credentials have not expired: the storage integration credentials rotate every 180 days, and the next rotation for Meridian's stage is 2025-01-15. Third, confirm that the Orion export job is running by checking <code>GET /v2/meridian/exports/status</code> — the last_export_at timestamp should be within the past 90 minutes. If last_export_at is older than 90 minutes, the export job has stalled and David Park should be paged. Fourth, if files are arriving in the stage but not visible in Meridian's curated zone, the issue is downstream of Orion and should be investigated by Meridian's Snowflake team. David Park can provide the raw Parquet file list in the external stage on request.</p>
+
+<p><em>— End of guide —</em></p>
+
+</body>
+</html>

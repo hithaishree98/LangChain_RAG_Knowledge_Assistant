@@ -1,0 +1,83 @@
+{
+  "id": "TICK-4521",
+  "subject": "Login latency spike — Meridian analyst users (west coast offices disproportionately affected)",
+  "description": "Meridian Financial is reporting severely elevated login times for analyst seats. P95 login latency has degraded from a stable baseline of approximately 800ms to consistently exceeding 2,400ms over a three-week window ending 2024-09-14. The degradation is not uniform across the estate: west coast offices are significantly worse than east coast. Denver has 11 active analysts, Seattle has 9, and Los Angeles has 7, all of whom report substantially higher login times than the 14 analysts based in New York City. The pattern is most severe during the 09:00-10:00 ET morning window, which coincides with peak analyst activity at the start of the trading day. The west coast degradation is worse because those users attempt to log in approximately 30-40 minutes after east coast users, at which point the backend nodes are already saturated and the load balancer rebalancer has not yet redistributed load. The load balancer sticky-session rule pins each user to a specific backend node for the duration of their session. Orion's backend node pool for Meridian's tenant is tuned for median customer traffic patterns — it assumes steady, distributed login activity. Meridian's analyst population generates bursty traffic: 30-35 analysts attempt to log in within a 15-minute window each morning, saturating their pinned nodes. The rebalancer runs on a fixed 15-minute window, which means nodes can sit at 90%+ CPU for up to 15 minutes before load is redistributed. This is the structural root cause of the degradation. The issue was raised by Mike Rodriguez, Head of Data Platform at Meridian, on 2024-09-14 via email and escalated to a conference call on 2024-09-15 with Sarah Chen (CTO), Elena Martinez (VP Customer Success), and David Park (FDE). Business impact is high: Meridian's CFO has directly questioned the value of the $28,000 per month platform fee, and Sarah Chen has explicitly stated that a slip past the September 25 production fix deadline will trigger executive escalation and place the 2026-06-30 contract renewal at risk.",
+  "priority": "P1",
+  "status": "resolved",
+  "created_at": "2024-09-15T10:12:00-04:00",
+  "resolved_at": "2024-09-25T09:45:00-04:00",
+  "customer_id": "CUST-0287",
+  "assignee": "David Park",
+  "reporter": "Mike Rodriguez",
+  "business_impact": "Meridian's CFO has directly questioned the $28,000/month platform fee due to the degradation. Sarah Chen has stated that a slip past 2024-09-25 will trigger executive escalation and risk the 2026-06-30 renewal. The 41 affected analysts are unable to begin their morning workflow on time, directly impacting regulatory reporting runs that must complete by 08:30 ET.",
+  "affected_users": 41,
+  "sla_status": "within SLA — P1 first response delivered within 45 minutes of ticket creation",
+  "technical_context": {
+    "baseline_p95_ms": 800,
+    "degraded_p95_ms": 2400,
+    "degradation_onset": "2024-09-03",
+    "peak_window_et": "09:00-10:00",
+    "worst_offices": ["Denver", "Seattle", "Los Angeles"],
+    "affected_node": "backend-prod-us-east-2-node-07",
+    "node_cpu_peak_pct": 92,
+    "rebalancer_window_minutes": 15,
+    "fix_rebalancer_window_minutes": 3,
+    "cpu_eviction_threshold_pct": 80
+  },
+  "comments": [
+    {
+      "author": "David Park",
+      "created_at": "2024-09-15T14:45:00-04:00",
+      "body": "Initial analysis from the call: the latency pattern is entirely consistent with sticky-session node saturation. When I pulled the auth service metrics for the past 14 days, I can see that the p95 latency time series tracks directly with the CPU utilization of backend-prod-us-east-2-node-07, which is the node to which most of Meridian's analyst sessions are pinned. The sticky-session rule uses a hash of the user agent plus first-octet IP to assign users to backend nodes. Because Meridian's east coast analysts all originate from the same /24 network block, they hash to the same backend node. The west coast offices use a different network block but the same session affinity rule routes them to the same already-saturated node approximately 35 minutes later when their workday begins. The fix requires two changes: first, reduce the sticky-session timeout from 15 minutes to 3 minutes so that idle sessions release their pinned node faster; second, add a CPU-pressure trigger to the rebalancer so that any node exceeding 80% CPU immediately force-evicts idle sessions and allows the load balancer to redistribute them. I will have a staging implementation ready by end of day 2024-09-17."
+    },
+    {
+      "author": "David Park",
+      "created_at": "2024-09-15T14:52:00-04:00",
+      "body": "Workaround shared with Mike Rodriguez: any individual analyst can clear their browser cache to force a new session and be reassigned to a fresh, less-loaded backend node. This works because cache-clearing invalidates the session cookie, forcing the load balancer to treat the next login as a new session and run the node-selection algorithm afresh. The reassignment provides relief for approximately 90 minutes — at which point the analyst's pinned node may become saturated again as other users accumulate on it. This workaround is not scalable for 41 analysts and creates user-experience friction, but it can unblock someone who is actively stuck and needs immediate access. Mike Rodriguez's team has been informed. Sarah Chen acknowledged the workaround but noted it is not acceptable as anything other than a temporary measure."
+    },
+    {
+      "author": "Priyanka Shah",
+      "created_at": "2024-09-16T09:30:00-04:00",
+      "body": "Confirmed David's analysis by running a detailed query against the Prometheus scrape data covering the 14-day period from 2024-09-01 through 2024-09-14. The data is unambiguous: backend-prod-us-east-2-node-07 CPU peaks at 92% during the 09:10-09:45 ET window on every weekday without exception. The correlation between node CPU and auth p95 latency is 0.97 (Pearson r). I also checked the other backend nodes in Meridian's pool: node-03, node-05, and node-11 all remain below 45% CPU during the same window. This confirms the issue is not a general capacity problem but a sticky-session routing problem — load is not being distributed across available capacity. The rebalancer logs show it triggers at 09:25, 09:40, and occasionally 09:55 ET — each time 15 minutes after the preceding trigger — and does redistribute load after each trigger, but by then the p95 has already peaked. The 15-minute rebalancer window is the central problem. Reducing it to 3 minutes would provide three rebalancing events during the worst 09:00-09:45 window instead of two, significantly reducing the peak CPU dwell time."
+    },
+    {
+      "author": "Priyanka Shah",
+      "created_at": "2024-09-16T16:15:00-04:00",
+      "body": "I've instrumented the staging environment to simulate Meridian's exact traffic profile. The synthetic load test uses the same four office network prefixes (NYC /24, Denver /24, Seattle /24, LA /24) and the same timing — NYC users start at 09:00, Denver at 09:35, Seattle at 09:38, LA at 09:42. With the current 15-minute rebalancer: staging p95 peaks at 2,210ms at 09:42 ET, which closely matches production. With the 3-minute rebalancer and 80% CPU eviction trigger applied: staging p95 stays below 850ms throughout the full 09:00-10:00 window. The CPU eviction trigger fires at 09:08, 09:11, 09:14, 09:17, and 09:20 ET — five times in the first 20 minutes, redistributing idle sessions before the node can saturate. After 09:20 the node CPU stabilizes below 70% and the eviction trigger stops firing. This is exactly the behavior we want. I'm satisfied that the fix is correct and ready to propose for customer validation."
+    },
+    {
+      "author": "Priyanka Shah",
+      "created_at": "2024-09-17T11:20:00-04:00",
+      "body": "Proposed fix finalized and documented in the engineering runbook. Two configuration changes are required: (1) reduce the sticky-session timeout parameter from 900 seconds (15 minutes) to 180 seconds (3 minutes) in the load balancer configuration for Meridian's tenant pool; (2) set the cpu_eviction_threshold parameter to 0.80 (80%) so that the rebalancer continuously monitors node CPU and evicts idle sessions from any node exceeding this threshold, regardless of the rebalancer window timer. Both changes are purely configuration — no code deployment is required. The rollback procedure is to run orion-cli config rollback --tenant meridian --to-revision previous, which reverts both parameters atomically within approximately 5 minutes. The change has been reviewed by the platform engineering team and is approved for deployment in staging on 2024-09-17 and production during the standard maintenance window on 2024-09-25 02:00-04:00 UTC."
+    },
+    {
+      "author": "David Park",
+      "created_at": "2024-09-18T16:00:00-04:00",
+      "body": "Status update for Sarah Chen per daily update commitment: fix is deployed in staging and running correctly. The staging tenant (tenant_meridian_staging) has been reconfigured with both parameters. Priyanka has confirmed that staging p95 held below 850ms in synthetic load testing at 09:00-10:00 ET on 2024-09-17 and again on 2024-09-18. Validation run with Mike Rodriguez's team is scheduled for 2024-09-20 09:00-10:00 ET. They will log in from all four office locations simultaneously against the staging tenant using clean cold sessions — no cached credentials. If staging p95 stays below 1,200ms throughout the window, we have a green light to proceed with production deployment on 2024-09-25. I will continue daily updates until the production deployment is confirmed."
+    },
+    {
+      "author": "David Park",
+      "created_at": "2024-09-19T16:00:00-04:00",
+      "body": "Day 2 daily update to Sarah Chen: no changes since yesterday. Staging is stable. Mike Rodriguez's team has confirmed participants for tomorrow's validation run: Lena Choi (Denver), Jason Tran (Seattle), Amir Patel (LA), and Ryan Kim (NYC). They will log in simultaneously at 09:15 ET using incognito sessions on Chrome to guarantee cold session state. David Park and Priyanka Shah will be monitoring the Grafana auth dashboard live during the window. Pass criterion: p95 login latency stays below 1,200ms throughout 09:00-10:00 ET. If the criterion is not met, we will not proceed with production and will reschedule after root-cause analysis. No known risks to the staging test at this time."
+    },
+    {
+      "author": "Mike Rodriguez",
+      "created_at": "2024-09-20T15:30:00-04:00",
+      "body": "Staging validation completed this morning. Our QA team executed the planned cold-session login from all four office locations simultaneously at 09:15 ET. Participants: Lena Choi from Denver, Jason Tran from Seattle, Amir Patel from LA, and Ryan Kim from NYC. All four logged in within a 2-minute window between 09:15 and 09:17 ET. P95 login latency as reported on the Grafana auth dashboard held between 720ms and 850ms throughout the entire 09:00-10:00 ET observation window. Lena Choi in Denver — historically the worst-affected — reported login completion in under 900ms. No user experienced a login time above 1,000ms. I am satisfied that the fix performs as expected. Green light from Meridian's side to proceed with production deployment on 2024-09-25. Please confirm the change window details."
+    },
+    {
+      "author": "David Park",
+      "created_at": "2024-09-23T09:00:00-04:00",
+      "body": "Change window confirmed for 2024-09-25 02:00-04:00 UTC, which is Meridian's standard maintenance window per SOW Section 2.1. The deployment is a configuration-only change requiring no service restart and no customer-facing downtime. Rollback plan: if p95 login latency degrades past 1,500ms at any point during the 09:00-10:00 ET monitoring window on 2024-09-25, David Park will immediately execute orion-cli config rollback --tenant meridian --to-revision previous, which reverts the sticky-session timeout and CPU eviction threshold to their prior values. Estimated rollback time is under 5 minutes. Mike Rodriguez's team will monitor from the Denver office — historically the worst-affected location — starting at 09:00 ET. David Park will be on standby for the full 09:00-10:00 window. Priyanka Shah will monitor backend node CPU and rebalancer metrics in parallel. Sarah Chen has been notified of the change window and rollback plan."
+    },
+    {
+      "author": "David Park",
+      "created_at": "2024-09-25T10:15:00-04:00",
+      "body": "Production fix confirmed successful. Configuration change deployed at 02:14 UTC on 2024-09-25 with no errors. Monitoring results for 09:00-10:00 ET: p95 login latency peaked at 810ms at 09:22 ET and held between 720ms and 850ms for the full hour. Mike Rodriguez's team confirmed positive results from all four office locations. Lena Choi (Denver) reported login in under 800ms, the best result she has seen in three weeks. The CPU eviction trigger on backend-prod-us-east-2-node-07 fired 7 times between 09:00 and 09:30 ET, redistributing idle sessions proactively before the node could saturate. By 09:30 all four nodes in Meridian's pool were below 60% CPU. No rollback was required. Closing this ticket as resolved. Root cause, fix, and validation results have been communicated to Sarah Chen. Post-incident review document to follow within 5 business days."
+    }
+  ],
+  "resolution": "Production fix deployed 2024-09-25 during the 02:00-04:00 UTC maintenance window. Sticky-session timeout reduced from 15 minutes to 3 minutes; CPU-pressure trigger added to rebalancer at 80% threshold. Mike Rodriguez's team validated on the morning of 2024-09-25: p95 login latency held at 720-850ms across Denver, Seattle, LA, and NYC during the 09:00-10:00 ET window. No rollback required. David Park confirmed resolution to Sarah Chen. Post-incident review document delivered 2024-09-30.",
+  "post_incident_review": "The root cause was a sticky-session configuration optimized for Orion's median customer traffic profile that was not suited to Meridian's bursty morning login pattern. The fix — shorter timeout plus CPU-pressure eviction — is a customer-specific configuration change. To prevent recurrence for other customers with similar traffic patterns, the platform team will add a heuristic to the onboarding checklist: if a customer has more than 30 analyst seats concentrated in 2+ geographic locations with different time zones, the sticky-session timeout should be set to 3 minutes at provisioning time rather than 15 minutes. The 15-minute default should be flagged for review. Additionally, the monitoring alert threshold for pinned-node CPU will be lowered from 95% to 75% for enterprise tenants to provide earlier warning.",
+  "related_tickets": ["TICK-4389", "TICK-4211"],
+  "tags": ["latency", "auth", "load-balancer", "enterprise-escalation", "sticky-session", "p1", "resolved"]
+}

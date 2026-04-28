@@ -328,39 +328,6 @@ def health_indicator(color: str, label: str) -> str:
     </div>
     """
 
-def confidence_bar(conf: float, sources: list) -> str:
-    """Confidence bar and source chips below each assistant message."""
-    pct = int(conf * 100)
-    if conf > 0.7:
-        color, label = "#22c55e", "High"
-    elif conf > 0.4:
-        color, label = "#f59e0b", "Medium"
-    else:
-        color, label = "#ef4444", "Low"
-
-    src_html = ""
-    if sources:
-        chips = "".join([
-            f'<span style="background:#1e1e2a;border:1px solid #2a2a3a;'
-            f'border-radius:4px;padding:2px 8px;font-size:11px;'
-            f'color:#8888aa;">{s}</span>'
-            for s in sources
-        ])
-        src_html = f'<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:4px;">{chips}</div>'
-
-    return f"""
-    <div style="margin-top:8px;padding:10px 12px;background:#111118;
-                border:1px solid #2a2a3a;border-radius:6px;">
-        <div style="display:flex;align-items:center;gap:12px;margin-bottom:4px;">
-            <span style="font-size:12px;color:{color};">Confidence: {pct}% ({label})</span>
-            <div style="flex:1;height:2px;background:#2a2a3a;border-radius:2px;">
-                <div style="width:{pct}%;height:2px;background:{color};border-radius:2px;"></div>
-            </div>
-        </div>
-        {src_html}
-    </div>
-    """
-
 def escalation_warning() -> str:
     return """
     <div style="margin-top:6px;padding:8px 12px;

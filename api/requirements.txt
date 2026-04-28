@@ -1,32 +1,64 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
 
-
+# ── Web framework ─────────────────────────────────────────────────────────────
 fastapi==0.115.0
 uvicorn==0.30.6
 python-multipart==0.0.9
 requests==2.32.3
+httpx>=0.27.0
 
-langchain==0.2.16
-langchain-core==0.2.38
-langchain-community==0.2.16
-langchain-openai==0.1.23
-langchain-groq==0.1.9
-langchain-chroma==0.1.4
-langchain-huggingface==0.0.3
+# ── LangChain stack ───────────────────────────────────────────────────────────
+# Pinned to the 0.3.x line: langchain-google-genai 2.x requires langchain-core
+# 0.3.x, which in turn dropped the pydantic_v1 shim that older langchain-
+# huggingface (0.0.3) relied on. Everything below moves together.
+langchain>=0.3.0,<0.4.0
+langchain-core>=0.3.0,<0.4.0
+langchain-community>=0.3.0,<0.4.0
+langchain-google-genai>=2.0.0
+langchain-chroma>=0.2.0,<0.3.0
+langchain-huggingface>=0.3.0,<0.4.0
+langchain-text-splitters>=0.3.0,<0.4.0
 
+# ── LangGraph stateful workflow ───────────────────────────────────────────────
+langgraph>=0.2.0
 
-chromadb==0.5.3
+# ── Vector store ──────────────────────────────────────────────────────────────
+# 0.5.5+ needed for langchain-chroma 0.2.x compatibility.
+chromadb>=0.5.5
 
+# ── Document loaders ─────────────────────────────────────────────────────────
 pypdf==4.3.1
 docx2txt==0.8
 unstructured==0.15.0
 unstructured[html]
 beautifulsoup4==4.12.3
 lxml==5.3.0
+pymupdf==1.24.9
+pdfplumber==0.11.0
+python-docx==1.1.2
 
-
+# ── ML / embeddings ───────────────────────────────────────────────────────────
+numpy>=1.24.0
 einops==0.8.0
 torch==2.4.0+cpu
 sentence-transformers==3.0.1
 
+# ── Hybrid search ─────────────────────────────────────────────────────────────
+rank-bm25==0.2.2
+
+# ── Sentence boundary detection ───────────────────────────────────────────────
+# Model downloaded separately: python -m spacy download en_core_web_sm
+# Dockerfile handles this automatically.
+spacy>=3.7.0,<4.0.0
+
+# ── Auth / security ───────────────────────────────────────────────────────────
+python-jose[cryptography]==3.3.0
+slowapi==0.1.9
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
 python-dotenv==1.0.1
+typing_extensions>=4.0.0
+tiktoken==0.7.0
+
+# ── Tests ─────────────────────────────────────────────────────────────────────
+pytest>=7.0.0

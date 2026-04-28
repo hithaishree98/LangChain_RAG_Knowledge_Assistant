@@ -1,5 +1,17 @@
+import logging
 import httpx
 import os
+
+_log = logging.getLogger(__name__)
+
+# Confidence-label thresholds for Slack messages.
+# - HIGH:    "we'd ship this" — above the high-confidence floor
+# - MEDIUM:  "review before sending" — between escalation floor and high floor
+# - LOW:     escalated by the API (matches main.CONFIDENCE_THRESHOLD = 0.4)
+# Kept as module constants instead of bare numerics so the labels and the
+# escalation logic in main.py can be reasoned about together.
+_CONFIDENCE_HIGH = 0.7
+_CONFIDENCE_ESCALATION = 0.4   # mirrors main.CONFIDENCE_THRESHOLD
 
 
 async def send_to_slack(question: str, answer: str, sources: list,
@@ -8,9 +20,9 @@ async def send_to_slack(question: str, answer: str, sources: list,
     if not webhook_url:
         return False
 
-    if confidence > 0.7:
+    if confidence > _CONFIDENCE_HIGH:
         conf_label = "High"
-    elif confidence > 0.4:
+    elif confidence > _CONFIDENCE_ESCALATION:
         conf_label = "Medium"
     else:
         conf_label = "Low — verify before sharing"
@@ -45,5 +57,5 @@ async def send_to_slack(question: str, answer: str, sources: list,
             r = await client.post(webhook_url, json=payload, timeout=10)
         return r.status_code == 200
     except Exception as e:
-        print(f"Slack notification failed: {e}")
+        _log.warning("slack_notification_failed: %s", e)
         return False

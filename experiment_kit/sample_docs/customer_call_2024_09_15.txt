@@ -1,0 +1,123 @@
+Sarah Chen: Alright, can everyone hear me? Mike, are you on?
+
+Mike Rodriguez: Yeah I'm here. Sorry, my camera's being weird today.
+
+Sarah Chen: No worries. David, Elena, thanks for making time on short notice. I wanted to talk about what we're seeing with login latency because it's getting to a point where I'm fielding questions from the executive team.
+
+David Park: Absolutely, that's why we wanted to jump on. Before we dive in can I ask Mike to maybe share the graph from this morning?
+
+Mike Rodriguez: Yeah let me pull it up. So, um, this is the last fourteen days. You can see starting around, what is that, the third? Yeah September third. Login p95 was sitting around eight hundred milliseconds which is, you know, where it's been all year basically. And then you see this creeping pattern and now we're consistently over two thousand four hundred milliseconds during the morning rush.
+
+Elena Martinez: And when you say morning rush, you mean what, nine to ten Eastern?
+
+Mike Rodriguez: Exactly. Nine to ten ET is where it's worst. But the thing that's bothering me is it's uneven. Our west coast offices, so Denver and Seattle and LA, they're getting it worse than the east coast offices.
+
+David Park: Okay that's actually a useful signal. Give me one second.
+
+Sarah Chen: While David's looking, I want to be direct here. We've had three weeks of this. My CFO is asking why we're paying twenty-eight thousand a month for a platform that's slower than our old one. I need to be able to tell him something.
+
+Elena Martinez: I hear you Sarah and I want to acknowledge that directly. This is not the level of service you're paying for and we need to close this out.
+
+David Park: Okay I think I might have it. Mike, when the latency spikes, are the users hitting the same node consistently or are they bouncing around?
+
+Mike Rodriguez: Let me check. Hmm. It looks like, yeah, same node. They seem to be sticky to one specific node and that node is saturated.
+
+David Park: Okay. So this is going to sound technical but bear with me. We have a load balancer sticky-session rule that pins users to a backend for session persistence. That rule was tuned for our median customer. Meridian's analyst traffic pattern is bursty in a way that saturates the pinned node before the session rebalance window kicks in. The west coast pattern makes sense now because those users are logging in during a window when east coast users have already saturated their pinned nodes and the rebalancer hasn't caught up. The rebalancer runs on a fixed fifteen-minute cycle. So if east coast users saturate the node at nine oh five, the rebalancer doesn't fire until nine twenty, and by then west coast users are piling on top of an already saturated node.
+
+Sarah Chen: So this is a configuration issue on your side.
+
+David Park: Yes. It's a misconfiguration. I want to be clear about that. I'm going to open a ticket right now, that's going to be a P1, and the fix is a change to the sticky-session rule plus shortening the rebalance window. Specifically, reducing the sticky-session timeout from fifteen minutes to three minutes and adding a CPU-pressure trigger that force-evicts idle sessions whenever a node's CPU exceeds eighty percent. I can have that in staging by end of day tomorrow and production by the twenty-fifth if testing goes clean.
+
+Sarah Chen: The twenty-fifth. That's another week.
+
+David Park: I know. If I push faster than that I risk introducing a different problem. This touches session handling for every user.
+
+Elena Martinez: Sarah, is there anything we can do for your team in the meantime? On the user side?
+
+Mike Rodriguez: The workaround we've found is clearing browser cache fixes it for an individual user for about ninety minutes. But that's not a scalable answer for forty-one analysts.
+
+David Park: Right, that works because it forces a new session and they get assigned to a fresh node. It's not a fix but it can unblock someone who's actively stuck.
+
+Sarah Chen: Okay. David I'm going to hold you to the twenty-fifth. If we slip on that, this becomes an executive escalation.
+
+David Park: Understood. I'll send daily status updates until it's shipped.
+
+Sarah Chen: Before we move on. David, walk me through what the staging test actually looks like. I don't want to find out on the twenty-fifth that the fix didn't work the way you expected.
+
+David Park: Fair. So staging mirrors production and gets a one percent sample of real events. For the test we're going to use synthetic load — Mike's team has agreed to log in from all four offices simultaneously at nine fifteen ET on September twentieth. We'll watch the p95 in real time on the Grafana auth dashboard. If it stays below twelve hundred milliseconds throughout the nine-to-ten window we call it a pass.
+
+Mike Rodriguez: That's right. We've got people in each office who've agreed to log in clean, not from cache, so it's a genuine cold session hit on the node.
+
+Sarah Chen: And if the staging test fails?
+
+David Park: Then we don't push to production on the twenty-fifth. We fix whatever's wrong in staging and reschedule. I'd rather delay by a few days than push something broken.
+
+Sarah Chen: What's the rollback plan if it passes staging but then breaks something in production?
+
+David Park: The change is purely configuration — it's not a code deploy. So the rollback is running orion-cli config rollback, which reverts the sticky-session config within about five minutes. We'll have someone watching the auth p95 dashboard from nine to ten ET on the twenty-fifth. If p95 degrades past fifteen hundred milliseconds in the first hour post-rollout, we roll back immediately without waiting for more data.
+
+Mike Rodriguez: That works for us. We'll have our QA lead monitoring from the Denver office since that's where we see the worst degradation currently.
+
+Sarah Chen: Good. Let's move to a few other topics while we have everyone together. David, I want to ask about the integration guide — specifically the Plaid migration. Priya flagged a concern before this call that she's worried about the Q2 2025 deprecation of the v3.2.1 schema.
+
+David Park: Right, so Plaid has announced end-of-life for v3.2.1 in Q2 2025. Orion's v4.0 connector is targeted for Q1 2025 — we're actually in the beta program for that and Meridian has requested early access on TICK-4702. The migration from v3.2.1 to v4.0 is a five-step process: first, update the Plaid webhook destination URL to point to the v4 endpoint; second, update the Orion event schema mapping in the admin console; third, send a synthetic test event through the Plaid sandbox and confirm it lands cleanly in the Orion event log; fourth, monitor the plaid_schema_errors metric in Grafana for twenty-four hours to confirm zero validation failures; fifth, notify your Orion FDE so we can disable the v3.2.1 compatibility shim on our side. If the shim isn't disabled the two schemas can conflict and cause silent ingestion failures. Given the Q2 2025 deprecation date, Meridian should plan to start this migration no later than January 2025 to leave adequate buffer.
+
+Mike Rodriguez: Priya's going to want to be on a call specifically about that. She manages the ingestion pipeline. Can we set up a separate session with her and your product team?
+
+David Park: Absolutely, I'll schedule that. I'd suggest October or November so we're well ahead of the migration window.
+
+Sarah Chen: Good. While we're on the integration topic, what's the status on the Snowflake export format? Priya was asking about Parquet compatibility — we need to confirm the spec before she can start downstream pipeline work.
+
+David Park: The Snowflake export currently lands in your external stage as Parquet files partitioned by hour. The specific schema version and field names need to be confirmed with our product team because there are some changes coming in Q1 2025. Priya should get the current export format specification from our product team by September thirtieth — that gives her enough time to assess what downstream changes are needed before the Q1 schema update.
+
+Mike Rodriguez: Yeah she mentioned that to me before we jumped on. September thirtieth is doable on her end.
+
+Sarah Chen: Good. Now I want to ask about something David mentioned at the last QBR — the reranker upgrade. You said it was included in our Enterprise tier but disabled by default.
+
+David Park: That's right. The cross-encoder reranker is included in the Enterprise tier at no additional charge. It's disabled by default because it adds about a hundred and eighty milliseconds to p95 query latency, and most customers prefer lower latency over the quality improvement. For Meridian specifically, we ran a benchmark against your document corpus in September and found the reranker improves recall at five by twelve percent — which is meaningful for regulatory reporting queries where missing a relevant document has compliance implications. You can enable it with a single configuration change: orion-cli config set --tenant meridian --key retrieval.reranker --value cross-encoder. I'd recommend enabling it once the login latency issue is resolved so we're not adding latency during a period when your users are already sensitive to performance. But it's worth enabling before your UK launch if you go ahead with that.
+
+Sarah Chen: Twelve percent is actually significant for the reporting use case. Let's revisit that in November once the latency issue is behind us.
+
+Elena Martinez: I can include the reranker performance data in the seat expansion proposal I'm putting together. It's a good proof point for platform value.
+
+Sarah Chen: Agreed. The other thing, while I have you both. Priya mentioned the UK thing at the QBR. Where are we on EU region availability?
+
+Elena Martinez: Our current ETA for eu-west-2 is April of next year. GA target. So if your UK subsidiary launches in Q2 you should be right at the edge of our availability.
+
+Sarah Chen: That's tight. I need more margin than that. What's the risk that April slips?
+
+Elena Martinez: Honestly? Moderate. We've slipped region launches before. I don't want to commit to something I can't deliver.
+
+Sarah Chen: Appreciate the honesty. David can you put together something on what a contingency would look like? What if we had to launch UK while you're still on us-east-2 only?
+
+David Park: Yeah I can scope that. Probably a feasibility doc by end of October. It would likely involve a data replication pipe and some latency tradeoffs for UK users. I'd also want to look at whether PCI DSS and GLBA compliance posture changes with data crossing the Atlantic — that's a question for our legal team but I'll flag it.
+
+Sarah Chen: That's fine. I just need options.
+
+Mike Rodriguez: One more thing before we close. The billing anomaly last month, the duplicate invoice. Are we good on that?
+
+Elena Martinez: Yes that's fully resolved. We put idempotency keys on the billing event processor. Your AP team should have seen the void go through.
+
+Mike Rodriguez: Yeah they confirmed that. Just wanted it on the record.
+
+Sarah Chen: Let me read back the action items so we're all on the same page. David, one: login hotfix in production by September twenty-fifth with daily status updates to me until it ships.
+
+David Park: Confirmed.
+
+Sarah Chen: David, two: UK contingency feasibility document by end of October.
+
+David Park: October thirty-first, yes.
+
+Sarah Chen: Elena, three: seat expansion proposal with pricing for twenty to thirty additional seats, by mid-November.
+
+Elena Martinez: I'll have it by November fifteenth.
+
+Sarah Chen: And Priya's not on the call but Mike can you relay this — four: Priya to get the Snowflake export format specification to the Orion product team by September thirtieth.
+
+Mike Rodriguez: Yeah she mentioned it to me before we jumped on. September thirtieth is doable.
+
+Sarah Chen: Good. Also Elena I want a conversation about a possible early renewal in the next two weeks. We're at forty-one of fifty seats and I expect to ask for twenty to thirty more by Q1.
+
+Elena Martinez: I'll have a proposal by mid-November.
+
+Sarah Chen: Great. Anything else? Okay, thanks everyone.

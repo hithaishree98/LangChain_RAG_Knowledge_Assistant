@@ -1,0 +1,15 @@
+{
+  "chunking_config": "full",
+  "semantic_similarity_avg": 0.316,
+  "key_facts_coverage_avg": 0.606,
+  "mean_faithfulness_score": 0.641,
+  "avg_loop_count": 1.0,
+  "recall_at_5": 1.0,
+  "mrr": 0.705,
+  "chunk_precision_at_5": null,
+  "chunk_recall_at_5": null,
+  "p50_latency_ms": 11250.9,
+  "p95_latency_ms": 28828.4,
+  "error_rate": 0.0,
+  "count": 22
+}
