@@ -291,8 +291,123 @@ hr {
 }
 """
 
+FDE_CARDS = """
+.commitment-card {
+    border-left: 3px solid #e74c3c;
+    padding: 8px;
+    margin: 4px 0;
+}
+.open-item-card {
+    border-left: 3px solid #f39c12;
+    padding: 8px;
+    margin: 4px 0;
+}
+.posture-lead {
+    color: #27ae60;
+    font-weight: bold;
+}
+.posture-push {
+    color: #e74c3c;
+    font-weight: bold;
+}
+.stale-warning {
+    background: #fff3cd;
+    border: 1px solid #ffc107;
+    padding: 8px;
+    border-radius: 4px;
+    color: #856404;
+    font-size: 13px;
+    margin: 4px 0;
+}
+
+/* Call snapshot bar */
+.call-snapshot {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    padding: 12px 16px;
+    background: #111118;
+    border: 1px solid #2a2a3a;
+    border-radius: 8px;
+    margin-bottom: 16px;
+}
+.snapshot-item {
+    text-align: center;
+    min-width: 48px;
+}
+.snapshot-number {
+    font-size: 26px;
+    font-weight: 600;
+    line-height: 1.1;
+    font-family: var(--font-mono);
+}
+.snapshot-label {
+    font-size: 10px;
+    color: #55556a;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-top: 2px;
+}
+.snapshot-divider {
+    width: 1px;
+    height: 36px;
+    background: #2a2a3a;
+    flex-shrink: 0;
+}
+
+/* Confidence / amber warning strip */
+.confidence-warning {
+    padding: 8px 12px;
+    background: rgba(245,158,11,0.08);
+    border-left: 3px solid #f59e0b;
+    border-radius: 4px;
+    font-size: 12px;
+    color: #f59e0b;
+    margin: 6px 0 10px 0;
+}
+
+/* Empty / not-found placeholder */
+.not-found {
+    padding: 48px 0;
+    text-align: center;
+    color: #55556a;
+    font-size: 13px;
+}
+
+/* Small text for source details inside cards */
+.source-detail {
+    font-size: 11px;
+    color: #55556a;
+    margin-top: 3px;
+}
+
+/* Italic annotation for posture grounding item */
+.grounding-item {
+    font-size: 11px;
+    color: #8888aa;
+    font-style: italic;
+    margin-top: 3px;
+    padding-left: 4px;
+}
+
+/* Verbatim source quote inside anticipated questions */
+.source-quote {
+    font-size: 11px;
+    color: #8888aa;
+    font-style: italic;
+    border-left: 2px solid #3a3a52;
+    padding: 2px 8px;
+    margin-top: 6px;
+}
+"""
+
 # ── Assembled stylesheet ───────────────────────────────────────────────────────
-CSS = f"<style>{FONTS}{VARIABLES}{GLOBAL}{SIDEBAR}{TABS}{CHAT}{COMPONENTS}</style>"
+CSS = f"<style>{FONTS}{VARIABLES}{GLOBAL}{SIDEBAR}{TABS}{CHAT}{COMPONENTS}{FDE_CARDS}</style>"
+
+
+def load_css() -> str:
+    """Return the full assembled stylesheet as an HTML <style> block."""
+    return CSS
 
 
 # ── Reusable HTML snippets ─────────────────────────────────────────────────────
@@ -355,5 +470,44 @@ def gap_row(text: str) -> str:
                 border-left:3px solid #ef4444;border-radius:4px;
                 font-size:12px;color:#8888aa;">
         {_html.escape(text)}
+    </div>
+    """
+
+
+def answer_block(text: str) -> str:
+    """Bright-white prominent rendering for the Lookup tab's primary answer.
+
+    The default Streamlit body text is on the muted side in dark mode; the actual
+    answer needs to pop visually since it's the user's primary takeaway. Citations
+    and passages stay subdued so the answer reads as the headline.
+
+    Note: simple paragraph splitting only — we trust the LLM not to inject HTML.
+    """
+    safe = _html.escape(text or "")
+    paragraphs = [p.strip() for p in safe.split("\n\n") if p.strip()]
+    body = "".join(
+        f'<p style="margin:0 0 10px 0;color:#ffffff;font-size:15px;'
+        f'line-height:1.55;">{p}</p>'
+        for p in paragraphs
+    )
+    return f"""
+    <div style="padding:14px 16px;margin:8px 0 16px 0;
+                background:#16161f;border:1px solid #2a2a3a;
+                border-left:3px solid #4f6ef7;border-radius:6px;">
+        {body}
+    </div>
+    """
+
+
+def claim_block(text: str) -> str:
+    """Bright rendering for individual issue/risk/talking-point claims in briefs.
+
+    Used inside expanders where the claim text is the primary content.
+    """
+    safe = _html.escape(text or "")
+    return f"""
+    <div style="color:#ffffff;font-size:14px;line-height:1.5;
+                margin-bottom:6px;">
+        {safe}
     </div>
     """

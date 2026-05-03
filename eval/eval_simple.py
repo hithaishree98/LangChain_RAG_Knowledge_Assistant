@@ -1,15 +1,12 @@
-import csv, re, json, time, statistics, requests
+import csv, re, json, time, statistics, requests, datetime
 from typing import List, Optional
 from sentence_transformers import SentenceTransformer
 import numpy as np
 import os
 
-BRIEF_URL = os.getenv("BRIEF_URL", "http://localhost:8000/brief")
-# Derive the auth-token URL from BRIEF_URL so the eval works against any deployment
-# (localhost in dev, a staging URL in CI). The /brief and /auth/token endpoints
-# share the same host.
-AUTH_URL  = BRIEF_URL.rsplit("/", 1)[0] + "/auth/token"
-MODEL    = "llama-3.1-8b-instant"
+QUERY_URL = os.getenv("QUERY_URL", "http://localhost:8000/query")
+# Derive the auth-token URL from QUERY_URL so the eval works against any deployment.
+AUTH_URL  = QUERY_URL.rsplit("/", 1)[0] + "/auth/token"
 API_KEY  = os.getenv("API_KEY", "")
 
 # Tenant identity is JWT-only — the API used to honor a `?user_id=` query param,
@@ -19,6 +16,10 @@ EVAL_WORKSPACE = os.getenv("EVAL_WORKSPACE", "eval-default")
 EVAL_PASSKEY   = os.getenv("EVAL_PASSKEY", "eval-default-passkey")
 
 INTER_QUERY_SLEEP = float(os.getenv("INTER_QUERY_SLEEP", "15"))
+
+# Customer slug to query against. Must be created via POST /customers first.
+# If not set, falls back to the JWT user_id (legacy behaviour).
+EVAL_CUSTOMER_ID = os.getenv("EVAL_CUSTOMER_ID", "")
 
 
 def _mint_token(workspace: str, passkey: str) -> tuple:
@@ -39,7 +40,18 @@ def _mint_token(workspace: str, passkey: str) -> tuple:
     return data["token"], data["user_id"]
 
 
-_TOKEN, _USER_ID = _mint_token(EVAL_WORKSPACE, EVAL_PASSKEY)
+# Lazy token: the previous module-level call meant `import eval_simple`
+# from ANY context (Jupyter notebook, test, helper script) hit the network
+# and crashed if the API was offline. Now we mint on first use and cache.
+_TOKEN: Optional[str] = None
+_USER_ID: Optional[str] = None
+
+
+def _ensure_token():
+    global _TOKEN, _USER_ID
+    if _TOKEN is None:
+        _TOKEN, _USER_ID = _mint_token(EVAL_WORKSPACE, EVAL_PASSKEY)
+    return _TOKEN, _USER_ID
 
 EMB_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 embedder = SentenceTransformer(EMB_MODEL)
@@ -63,69 +75,80 @@ def semantic_sim(a: str, b: str) -> float:
 
 
 def coverage(answer: str, facts: List[str]) -> float:
-    if not facts: return 0.0
-    ans = normalize(answer)
+    """Fraction of `facts` that the answer covers — by substring match OR
+    by sentence-level semantic similarity.
+
+    Previous implementation called ``semantic_sim(answer, f)`` (whole answer
+    vs. one short fact). On long answers the cosine similarity is high
+    against essentially any topic-related fact — inflated the metric to the
+    point of meaninglessness. We instead split the answer into sentences and
+    require AT LEAST ONE sentence to be similar to the fact, which is the
+    semantically correct definition of "this fact is covered somewhere in
+    the answer."
+    """
+    if not facts:
+        return 0.0
+    ans_lower = normalize(answer)
+    # Split answer into sentence-ish units for fact-level similarity. Filter
+    # short fragments so noise like "OK." doesn't get weighted as a sentence.
+    sentences = [s.strip() for s in re.split(r"[.!?]\s+", answer) if len(s.strip()) > 15]
     hit = 0
     for f in facts:
         f = f.strip()
-        if not f: continue
-        if f.lower() in ans or semantic_sim(answer, f) >= 0.6:
+        if not f:
+            continue
+        # Cheap path first: substring match on lowercased answer.
+        if f.lower() in ans_lower:
+            hit += 1
+            continue
+        # Fall back to per-sentence semantic similarity. A fact is "covered"
+        # iff some sentence is similar to it (>= 0.6 cosine).
+        if any(semantic_sim(s, f) >= 0.6 for s in sentences):
             hit += 1
     return hit / max(1, len(facts))
 
 
 def ask(question: str, user_id: str = None) -> dict:
-    # user_id arg is kept for back-compat with callers but ignored — tenancy
-    # comes from the JWT minted at module import. Pass the same id as customer_id
-    # so the brief logs attribute the query to the eval workspace.
-    customer_id = user_id or _USER_ID
-    headers = {"Authorization": f"Bearer {_TOKEN}"}
+    # customer_id resolution order:
+    #   1. EVAL_CUSTOMER_ID env var (explicit customer slug)
+    #   2. user_id arg (back-compat)
+    #   3. JWT user_id (legacy fallback — only works if a customer with that slug exists)
+    token, default_user = _ensure_token()
+    customer_id = EVAL_CUSTOMER_ID or user_id or default_user
+    headers = {"Authorization": f"Bearer {token}"}
     if API_KEY:
         headers["X-API-Key"] = API_KEY
     r = requests.post(
-        BRIEF_URL,
-        json={"query": question, "customer_id": customer_id},
+        QUERY_URL,
+        json={"question": question, "customer_id": customer_id},
         headers=headers,
         timeout=180,
     )
     if not r.ok:
         return {"error": f"HTTP {r.status_code}: {r.text[:200]}"}
     data = r.json()
-    brief = data.get("brief", {})
-    # Detect silent LLM failures: brief returned HTTP 200 but the reason node failed
-    # (e.g. Groq rate limit after retries exhausted). In that case issues/risks/
-    # talking_points are empty and open_questions contains an error string.
-    open_qs = brief.get("open_questions", [])
-    if (not brief.get("issues") and not brief.get("risks")
-            and not brief.get("talking_points")
-            and any(isinstance(q, str)
-                    and ("could not analyze" in q.lower()
-                         or "could not parse analyst" in q.lower())
-                    for q in open_qs)):
-        msg = next((q for q in open_qs if isinstance(q, str)), "silent LLM failure")
-        return {"error": f"silent_llm_failure: {msg[:150]}"}
-    claims = (
-        [item.get("claim", "") for item in brief.get("issues", []) if isinstance(item, dict)]
-        + [item.get("claim", "") for item in brief.get("risks", []) if isinstance(item, dict)]
-        + [item.get("point", "") for item in brief.get("talking_points", []) if isinstance(item, dict)]
-        + [q for q in brief.get("open_questions", []) if isinstance(q, str)]
-    )
-    answer = " ".join(c for c in claims if c)
+    answer_status = data.get("answer_status", "not_found")
+    answer = data.get("answer") or ""
+    if not answer or answer_status == "not_found":
+        return {"error": f"answer_status={answer_status}"}
+    # Extract source from the single citation the /query endpoint returns
+    citation = data.get("citation") or {}
+    sources = [citation["document"]] if citation.get("document") else []
     return {
-        "answer":             answer,
-        "confidence":         data.get("faithfulness_score", 0.0),
-        "sources":            [s["filename"] for s in data.get("sources", []) if isinstance(s, dict) and "filename" in s],
-        "faithfulness_score": data.get("faithfulness_score", 0.0),
-        "loop_count":         data.get("loop_count", 0),
+        "answer":       answer,
+        "confidence":   1.0 if answer_status == "ok" else 0.5,
+        "sources":      sources,
+        "answer_status": answer_status,
+        "recency_flag": data.get("recency_flag"),
     }
 
 # ── Retrieval quality: source-level ──────────────────────────────────────────
 
 def recall_at_k(retrieved_sources: List[str], gold_source: str, k: int = 5) -> float:
-    """1.0 if gold_source appears in the top-k retrieved sources, else 0.0."""
+    """1.0 if gold_source appears (as substring) in the top-k retrieved sources, else 0.0."""
     if not gold_source:
         return 0.0
-    return 1.0 if gold_source.lower() in [s.lower() for s in retrieved_sources[:k]] else 0.0
+    return 1.0 if any(gold_source.lower() in s.lower() for s in retrieved_sources[:k]) else 0.0
 
 
 def reciprocal_rank(retrieved_sources: List[str], gold_source: str) -> float:
@@ -188,8 +211,6 @@ def evaluate(csv_path: str, chunking_config: Optional[str] = None, out_dir: Opti
 
     sims, covs, lats = [], [], []
     recalls, rrs = [], []
-    chunk_precs, chunk_recs = [], []
-    faith_scores, loop_counts = [], []
     errors = 0
 
     for i, row in enumerate(rows, 1):
@@ -212,43 +233,25 @@ def evaluate(csv_path: str, chunking_config: Optional[str] = None, out_dir: Opti
 
         ans     = resp.get("answer", "")
         sources = resp.get("sources", [])
-        faith   = resp.get("faithfulness_score", 0.0)
-        loops   = resp.get("loop_count", 0)
-        # The /brief response doesn't expose chunk IDs — only filenames.
-        # Chunk-level precision/recall requires the API to return chunk_ids in the
-        # brief payload. Until then this list stays empty and those metrics stay null.
-        retrieved_chunk_ids = []
 
         lat = (t1 - t0) * 1000.0
         lats.append(lat)
-        faith_scores.append(faith)
-        loop_counts.append(loops)
 
         sim = semantic_sim(ans, ref) if ref else 0.0
         cov = coverage(ans, facts)
         sims.append(sim)
         covs.append(cov)
 
-        # Source-level retrieval quality
+        # Source-level retrieval quality (/query exposes one citation; k=1 is the effective limit)
         r5 = recall_at_k(sources, gold_src, k=5)
         rr = reciprocal_rank(sources, gold_src)
         if gold_src:
             recalls.append(r5)
             rrs.append(rr)
 
-        # Chunk-level retrieval quality
-        if gold_cids and retrieved_chunk_ids:
-            cp = chunk_precision_at_k(retrieved_chunk_ids, gold_cids, k=5)
-            cr = chunk_recall_at_k(retrieved_chunk_ids, gold_cids, k=5)
-            chunk_precs.append(cp)
-            chunk_recs.append(cr)
-        else:
-            cp = cr = None
-
         print(
-            f"[{i}] sim={sim:.2f} cov={cov:.2f} faith={faith:.2f} loops={loops} "
-            f"R@5={r5:.0f} MRR={rr:.2f} lat={lat:.1f}ms"
-            + (f" chunkP={cp:.2f} chunkR={cr:.2f}" if cp is not None else "")
+            f"[{i}] sim={sim:.2f} cov={cov:.2f} "
+            f"R@1={r5:.0f} MRR={rr:.2f} lat={lat:.1f}ms"
         )
         print(f"     sources={sources}")
         print(f"     Q: {q}")
@@ -270,15 +273,22 @@ def evaluate(csv_path: str, chunking_config: Optional[str] = None, out_dir: Opti
     err_rate = errors / (n + errors) if (n + errors) else 0.0
 
     out = {
+        "run_metadata": {
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "embedder_model": EMB_MODEL,
+            "chunking_config": chunking_config,
+            "eval_workspace": EVAL_WORKSPACE,
+            "customer_id": EVAL_CUSTOMER_ID or "jwt_derived",
+            "query_url": QUERY_URL,
+            "thresholds": {
+                "sentence_sim_coverage": 0.6,
+            },
+        },
         "chunking_config":         chunking_config,
         "semantic_similarity_avg": round(sum(sims) / n, 3) if n else 0.0,
         "key_facts_coverage_avg":  round(sum(covs) / n, 3) if n else 0.0,
-        "mean_faithfulness_score": round(sum(faith_scores) / len(faith_scores), 3) if faith_scores else None,
-        "avg_loop_count":          round(sum(loop_counts) / len(loop_counts), 2) if loop_counts else None,
-        "recall_at_5":             round(sum(recalls) / len(recalls), 3) if recalls else None,
+        "recall_at_1":             round(sum(recalls) / len(recalls), 3) if recalls else None,
         "mrr":                     round(sum(rrs) / len(rrs), 3) if rrs else None,
-        "chunk_precision_at_5":    round(sum(chunk_precs) / len(chunk_precs), 3) if chunk_precs else None,
-        "chunk_recall_at_5":       round(sum(chunk_recs) / len(chunk_recs), 3) if chunk_recs else None,
         "p50_latency_ms":          round(p50, 1),
         "p95_latency_ms":          round(p95, 1),
         "error_rate":              round(err_rate, 3),
@@ -296,7 +306,7 @@ def evaluate(csv_path: str, chunking_config: Optional[str] = None, out_dir: Opti
 
 
 def evaluate_custom(questions: List[dict]):
-    sims, covs, lats, faith_scores, loop_counts = [], [], [], [], []
+    sims, covs, lats = [], [], []
     for i, row in enumerate(questions, 1):
         facts = [x for x in row.get("key_facts", "").split(";") if x.strip()]
         t0 = time.perf_counter()
@@ -307,19 +317,14 @@ def evaluate_custom(questions: List[dict]):
             ans = resp.get("answer", "")
             sim = semantic_sim(ans, row.get("reference_answer", ""))
             cov = coverage(ans, facts)
-            faith = resp.get("faithfulness_score", 0.0)
-            loops = resp.get("loop_count", 0)
             sims.append(sim); covs.append(cov)
-            faith_scores.append(faith); loop_counts.append(loops)
-            print(f"[{i}] sim={sim:.2f} cov={cov:.2f} faith={faith:.2f} loops={loops} "
+            print(f"[{i}] sim={sim:.2f} cov={cov:.2f} "
                   f"lat={lat:.1f}ms | {row['question']}")
 
     n = len(sims)
     return {
         "semantic_similarity_avg": round(sum(sims) / n, 3) if n else 0.0,
         "key_facts_coverage_avg":  round(sum(covs) / n, 3) if n else 0.0,
-        "mean_faithfulness_score": round(sum(faith_scores) / n, 3) if n else None,
-        "avg_loop_count":          round(sum(loop_counts) / n, 2) if n else None,
         "p50_latency_ms":          round(statistics.median(lats), 1) if lats else 0.0,
         "count": n,
     }

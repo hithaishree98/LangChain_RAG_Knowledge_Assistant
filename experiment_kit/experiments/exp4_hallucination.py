@@ -15,7 +15,6 @@ Requires: GOOGLE_API_KEY set. The LLM judge actually calls Gemini for
 Cases C-E, so each case takes ~1-3s. Cases A and B skip the LLM and run
 instantly.
 """
-import json
 import os
 import sys
 from pathlib import Path
@@ -24,7 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "api"))
 
 from langchain_core.documents import Document
-from output.brief_generator import generate_brief
+from langchain_utils import classify_claims, llm_judge_claims
 
 
 # ── Real chunks from the sample docs — these are what would be "retrieved" ──
@@ -128,19 +127,67 @@ case_E = {
 }
 
 
-def build_state(reasoning):
+def _extract_claims(case: dict) -> list:
+    """Flatten all claim strings from a case dict."""
+    claims = []
+    for key in ("issues", "risks", "open_questions"):
+        for item in case.get(key, []):
+            if isinstance(item, dict) and item.get("claim"):
+                claims.append(item["claim"])
+    for item in case.get("talking_points", []):
+        if isinstance(item, dict) and item.get("point"):
+            claims.append(item["point"])
+    return claims
+
+
+def analyze_case(case: dict, docs: list) -> dict:
+    """Run all 3 detection layers on a case's claims and return structured results."""
+    claims = _extract_claims(case)
+    if not claims:
+        return {"faithfulness_score": 1.0, "suspicious_facts": [],
+                "suspicious_claims": [], "verification_stats": {}}
+
+    # Layer 1 + 2: regex + classifier
+    classification = classify_claims(claims, docs)
+    flagged_by_regex = classification.get("flagged_by_regex", [])
+    needs_judge      = classification.get("needs_judge", [])
+
+    suspicious_claims = []
+    for entry in flagged_by_regex:
+        for fact in (entry.get("unsupported_facts") or [entry.get("claim", "")]):
+            suspicious_claims.append({
+                "caught_by": "regex",
+                "claim":     entry.get("claim", ""),
+                "reason":    f"atomic fact not in source: {fact}",
+            })
+
+    # Layer 3: LLM judge for ambiguous claims
+    llm_flagged = []
+    judge_enabled = os.getenv("ENABLE_LLM_JUDGE", "1") not in ("0", "false", "False")
+    if needs_judge and judge_enabled:
+        judge_output = llm_judge_claims(needs_judge, docs)
+        for u in judge_output.get("unsupported", []):
+            llm_flagged.append(u.get("claim", ""))
+            suspicious_claims.append({
+                "caught_by": "llm_judge",
+                "claim":     u.get("claim", ""),
+                "reason":    u.get("reason", "not grounded in source"),
+            })
+
+    n_flagged = len(suspicious_claims)
+    n_total   = len(claims)
+    faithfulness_score = round(1.0 - n_flagged / max(n_total, 1), 3)
+
     return {
-        "customer_id": "demo",
-        "original_query": "test",
-        "sub_queries": [],
-        "retrieved_chunks": faithful_chunks,
-        "parent_chunks": faithful_chunks,
-        "reasoning_output": reasoning,
-        "iteration_count": 1,
-        "is_sufficient": True,
-        "brief": None,
-        "information_gaps": [],
-        "audit_trail": [],
+        "faithfulness_score": faithfulness_score,
+        "suspicious_facts":   [s["reason"] for s in suspicious_claims if s["caught_by"] == "regex"],
+        "suspicious_claims":  suspicious_claims,
+        "verification_stats": {
+            "claims_total":      n_total,
+            "flagged_by_regex":  len(flagged_by_regex),
+            "sent_to_llm_judge": len(needs_judge),
+            "llm_flagged":       len(llm_flagged),
+        },
     }
 
 
@@ -155,9 +202,9 @@ def print_brief_summary(case_name, brief):
         print(f"    [{s['caught_by']}] {s['claim'][:80]}")
         print(f"        reason: {s['reason'][:100]}")
     print(f"  verification_stats  : total={stats.get('claims_total', 0)}  "
-          f"regex_verified={stats.get('verified_by_regex', 0)}  "
           f"regex_flagged={stats.get('flagged_by_regex', 0)}  "
-          f"sent_to_judge={stats.get('sent_to_llm_judge', 0)}")
+          f"sent_to_judge={stats.get('sent_to_llm_judge', 0)}  "
+          f"llm_flagged={stats.get('llm_flagged', 0)}")
 
 
 def run():
@@ -168,11 +215,11 @@ def run():
     print()
 
     results = {}
-    for name, reasoning in [("A", case_A), ("B", case_B),
-                             ("C", case_C), ("D", case_D), ("E", case_E)]:
-        brief = generate_brief(build_state(reasoning))
-        results[name] = brief
-        print_brief_summary(name, brief)
+    for name, case in [("A", case_A), ("B", case_B),
+                       ("C", case_C), ("D", case_D), ("E", case_E)]:
+        result = analyze_case(case, faithful_chunks)
+        results[name] = result
+        print_brief_summary(name, result)
 
     # ── Assertions — what each case should demonstrate ──────────────────────
     print()

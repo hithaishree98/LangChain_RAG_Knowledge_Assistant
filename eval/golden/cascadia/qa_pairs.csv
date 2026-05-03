@@ -1,0 +1,41 @@
+question,expected_answer_contains,expected_status,expected_source_contains
+What is the SLA uptime commitment?,99.9%,ok,transcript
+What is the current uptime?,99.1%,ok,transcript
+How far below SLA is Cascadia's uptime?,0.8%,ok,
+What is the status of TICK-4521?,open,ok,tickets
+What priority is TICK-4521?,P0,ok,tickets
+Who is assigned to TICK-4521?,eng-team,ok,tickets
+What region is TICK-4521 about?,us-east-2,ok,tickets
+What is the error in TICK-4521?,timeout,ok,tickets
+What is the status of TICK-4601?,open,ok,tickets
+What priority is TICK-4601?,P0,ok,tickets
+Who owns TICK-4601?,sre-team,ok,tickets
+What does TICK-4601 track?,uptime,ok,tickets
+What is TICK-4580?,SSO integration,ok,tickets
+What is the status of TICK-4580?,in_progress,ok,tickets
+When is the SSO integration due?,October 1,ok,transcript
+Is the SSO commitment overdue?,overdue,ok,commitments
+Who owns the SSO integration delivery?,dev-team,ok,commitments
+Is the customer aware of the SSO commitment?,true,ok,commitments
+What is the AWS us-east-2 region support target date?,November 30,ok,commitments
+What is the status of the uptime improvement commitment?,in_progress,ok,commitments
+When is the uptime improvement to 99.9% target?,December 31,ok,commitments
+What did John say about the deployment issues?,"resolved by end of month",ok,transcript
+What did Sarah commit to sending by Friday?,detailed update,ok,transcript
+Who was the customer contact on the call?,John,ok,transcript
+What is John's role at Cascadia?,CTO,ok,notes
+What was John's sentiment on the call?,frustrated,ok,notes
+What is the next scheduled call date?,October 22,ok,notes
+What action item did Sarah have after the September call?,Send detailed update email,ok,notes
+What is the customer sentiment?,at-risk,ok,notes
+What is the recommended posture for this call?,Acknowledge,ok,
+How many open P0 tickets are there?,2,ok,tickets
+What are the open P0 tickets?,TICK-4521,ok,tickets
+What is the deployment failure region?,us-east-2,ok,tickets
+When was TICK-4521 created?,2024-09-01,ok,tickets
+When was TICK-4601 created?,2024-10-01,ok,tickets
+How long has TICK-4521 been open?,6 weeks,ok,
+What platform issue is causing the us-east-2 failure?,timeout,ok,tickets
+Does Cascadia have any commitments past their due date?,yes,ok,commitments
+What is the Okta SSO integration status?,in_progress,ok,tickets
+What percentage improvement is needed on uptime?,0.8%,ok,

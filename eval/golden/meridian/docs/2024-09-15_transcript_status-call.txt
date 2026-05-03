@@ -1,0 +1,31 @@
+2024-09-15 Status Call - Meridian Financial
+
+Participants: Rachel (FDE), David Park (Meridian VP Engineering), Priya Desai (Meridian Head of Data)
+
+Rachel (FDE): Good afternoon everyone. Thanks for joining. Wanted to do a quick health check before your leadership review next week.
+
+David Park (Meridian): Thanks Rachel. The login latency issue is our biggest concern right now. We're seeing 800ms in the dashboard but spikes up to 2400ms during peak load. This is affecting our traders on the floor.
+
+Rachel (FDE): I understand the urgency. Our engineering team has identified the root cause — it's a sticky-session misconfiguration in the load balancer. We're committing to having the fix deployed by September 25th.
+
+David Park (Meridian): September 25th is acceptable. I need daily status updates until that's resolved. Can you commit to that?
+
+Rachel (FDE): Absolutely. I'll send you updates every morning at 9am. We have TICK-M001 open at P0 priority tracking this.
+
+Priya Desai (Meridian): I also want to raise the Plaid migration timeline. We need the new Plaid API integration before January 2025 — our current Plaid v2 contract expires then.
+
+Rachel (FDE): Noted. We have that on the roadmap for Q4 2024 with target completion January 2025. That's in our commitments tracker as well.
+
+Priya Desai (Meridian): Good. And the Snowflake schema spec — when can we see that?
+
+Rachel (FDE): Priya, I'll have the Snowflake connector schema specification to you by September 30th. We want to make sure it maps cleanly to your data warehouse structure.
+
+David Park (Meridian): One more item — EU region availability. Our European clients are asking about GDPR-compliant hosting.
+
+Rachel (FDE): That's on our roadmap for April 2025. We'll be launching eu-west-1 first to cover GDPR requirements.
+
+David Park (Meridian): April 2025 is workable for our planning cycle. But we need written confirmation.
+
+Rachel (FDE): I'll include EU region availability in the commitments tracker. Let me summarize the actions from today's call: sticky-session fix by September 25th with daily updates, Snowflake spec to Priya by September 30th, Plaid migration by January 2025, and EU region by April 2025.
+
+David Park (Meridian): That covers it. We'll be watching the September 25th fix closely.

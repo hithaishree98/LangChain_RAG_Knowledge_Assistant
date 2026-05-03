@@ -15,7 +15,13 @@ langchain>=0.3.0,<0.4.0
 langchain-core>=0.3.0,<0.4.0
 langchain-community>=0.3.0,<0.4.0
 langchain-google-genai>=2.0.0
+# OpenAI embeddings — preferred when OPENAI_API_KEY is set. Indexing on CPU
+# becomes ~10x faster than the local nomic/MiniLM path because the actual
+# embedding compute runs on OpenAI's GPUs and we just pay network round-trip.
+langchain-openai>=0.2.0,<0.3.0
 langchain-chroma>=0.2.0,<0.3.0
+# Kept for the offline / dev-without-OPENAI_API_KEY fallback embedder
+# (sentence-transformers/all-MiniLM-L6-v2). Production typically uses OpenAI.
 langchain-huggingface>=0.3.0,<0.4.0
 langchain-text-splitters>=0.3.0,<0.4.0
 
@@ -60,5 +66,12 @@ python-dotenv==1.0.1
 typing_extensions>=4.0.0
 tiktoken==0.7.0
 
+# ── Scheduling ───────────────────────────────────────────────────────────────
+apscheduler>=3.10.0
+
+# ── Slug generation ───────────────────────────────────────────────────────────
+python-slugify>=8.0.0
+
 # ── Tests ─────────────────────────────────────────────────────────────────────
 pytest>=7.0.0
+pytest-asyncio>=0.23.0

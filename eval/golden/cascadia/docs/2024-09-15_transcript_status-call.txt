@@ -1,0 +1,9 @@
+2024-09-15 Status Call - Cascadia Inc
+
+Sarah (FDE): Good morning everyone. Let's review where we stand.
+John (Customer): Thanks Sarah. We're still seeing the us-east-2 deployment issues.
+Sarah (FDE): I understand. We've escalated TICK-4521 to P0 internally.
+John (Customer): We need this resolved by end of month. Also, what's the status on the SSO integration you promised?
+Sarah (FDE): The SSO work is scheduled for completion by October 1st. That's a firm commitment.
+John (Customer): Good. Our SLA requires 99.9% uptime and we've been at 99.1% this quarter.
+Sarah (FDE): We're aware and engineering is on it. I'll send you a detailed update by Friday.

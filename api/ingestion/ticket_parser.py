@@ -36,6 +36,9 @@ class TicketStructure:
     priority: str = ""
     status: str = ""
     created_at: str = ""
+    updated_at: str = ""
+    reporter: str = ""
+    assignee: str = ""
     comments: List[Comment] = field(default_factory=list)
     resolution: str = ""
 
@@ -55,13 +58,19 @@ def parse(file_path: str) -> TicketStructure:
         if c.get("body", "").strip()
     ]
 
+    # Support both "id" and "ticket_id" as the primary key field
+    ticket_id = str(data.get("ticket_id") or data.get("id") or "")
+
     return TicketStructure(
-        ticket_id=str(data.get("id", "")),
+        ticket_id=ticket_id,
         subject=data.get("subject", "").strip(),
         description=data.get("description", "").strip(),
         priority=data.get("priority", ""),
         status=data.get("status", ""),
         created_at=data.get("created_at", ""),
+        updated_at=data.get("updated_at", ""),
+        reporter=data.get("reporter", ""),
+        assignee=data.get("assignee", ""),
         comments=comments,
-        resolution=data.get("resolution", "").strip(),
+        resolution=(data.get("resolution") or "").strip(),
     )

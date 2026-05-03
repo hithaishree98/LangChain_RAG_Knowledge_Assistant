@@ -1,0 +1,4 @@
+ticket_id,summary,status,priority,created_date,updated_date,reporter,assignee,description,resolution
+TICK-M001,Login latency spikes to 2400ms during peak load,open,P0,2024-09-15,2024-10-01,david.park@meridian.com,eng-team,Dashboard shows 800ms baseline but peaks at 2400ms under load. Sticky-session fix in progress. Affects trading floor users.,
+TICK-M002,Plaid API v2 migration required before contract expiry,open,P1,2024-09-15,2024-09-28,priya.desai@meridian.com,integrations-team,Plaid v2 contract expires January 2025. Must complete migration to new Plaid API by then.,
+TICK-M003,Snowflake connector schema specification pending,open,P2,2024-09-20,2024-09-25,priya.desai@meridian.com,data-team,Customer needs schema spec for Snowflake connector to map to their data warehouse. Target delivery September 30.,

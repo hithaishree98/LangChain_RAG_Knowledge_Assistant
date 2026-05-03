@@ -49,16 +49,20 @@ def main():
     print("=" * 72)
     print("Reuses eval_full workspace from exp1 (index unchanged across modes).")
 
+    import eval_simple as _ES
+
     for mode in ("dense", "dense_bm25", "full"):
         label = f"ret_{mode}"
         print(f"\n── [{mode}] ──")
         proc = start_api({"CHUNKING_MODE": "full", "RETRIEVAL_MODE": mode})
         try:
-            assert_workspace_ready("eval_full")
+            assert_workspace_ready("eval-full")
             print(f"  [eval] running eval against user_id=eval_full")
-            run_eval("eval_full", label)
+            run_eval("eval-full", label)
         finally:
             stop_api(proc)
+            _ES._TOKEN = None  # JWT_SECRET regenerates on restart; cached token is invalid
+            _ES._USER_ID = None
             time.sleep(2)
 
     print("\n=== Results ===")
@@ -69,9 +73,7 @@ def main():
             print(f"  {p.name}:")
             print(f"    semantic_sim={data.get('semantic_similarity_avg')}  "
                   f"coverage={data.get('key_facts_coverage_avg')}  "
-                  f"faithfulness={data.get('mean_faithfulness_score')}  "
-                  f"avg_loops={data.get('avg_loop_count')}  "
-                  f"recall@5={data.get('recall_at_5')}  "
+                  f"recall@1={data.get('recall_at_1')}  "
                   f"mrr={data.get('mrr')}  "
                   f"p50={data.get('p50_latency_ms')}ms")
         else:

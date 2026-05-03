@@ -1,0 +1,18 @@
+Post-call notes - September 15 2024
+Account: Meridian Financial
+Attendees: Rachel (FDE), David Park (VP Engineering), Priya Desai (Head of Data)
+
+Key points:
+- Login latency critical: 800ms baseline spiking to 2400ms peak. Affects trading floor. Root cause: sticky-session load balancer misconfiguration.
+- Committed to sticky-session fix by September 25. Daily morning updates (9am) requested by David.
+- Snowflake schema spec committed to Priya by September 30.
+- Plaid v2 contract expires Jan 2025 — migration must be complete by then. TICK-M002 tracking.
+- EU region (eu-west-1) committed for April 2025 — GDPR compliance requirement for European clients.
+
+Action items:
+- Rachel: Daily 9am updates to David until TICK-M001 resolved
+- Rachel: Snowflake connector schema spec to Priya by Sep 30
+- Engineering: Deploy sticky-session fix by Sep 25
+
+Customer sentiment: At-risk. David was direct about the severity of the latency issue impacting traders. Priya focused on timeline deliverables.
+Next call: October 20, 2024

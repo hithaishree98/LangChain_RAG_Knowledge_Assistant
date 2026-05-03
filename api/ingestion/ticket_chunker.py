@@ -24,6 +24,9 @@ def chunk(ticket: TicketStructure, source: str = "") -> List[Document]:
         "ticket_id": ticket.ticket_id,
         "priority": ticket.priority,
         "status": ticket.status,
+        "reporter": ticket.reporter,
+        "assignee": ticket.assignee,
+        "updated_at": ticket.updated_at,
     }
 
     # ── Subject + description ─────────────────────────────────────────────────

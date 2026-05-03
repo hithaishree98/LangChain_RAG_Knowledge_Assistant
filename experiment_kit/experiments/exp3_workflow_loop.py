@@ -48,11 +48,11 @@ def main():
             "WORKFLOW_MODE": mode,
         })
         try:
-            assert_workspace_ready("eval_full")
+            assert_workspace_ready("eval-full")
             print(f"  [eval] running faithfulness eval against eval_full")
             FE.evaluate_faithfulness(
                 str(KIT_ROOT / "eval_set.csv"),
-                customer_id="eval_full",
+                customer_id="eval-full",
                 out_dir=str(EVAL_RESULTS),
             )
             # faithfulness_eval now writes directly into eval_results/
@@ -66,6 +66,8 @@ def main():
                 print(f"  [warn] expected output file not found at {src}")
         finally:
             stop_api(proc)
+            FE._TOKEN = None  # JWT_SECRET regenerates on restart; cached token is invalid
+            FE._USER_ID = None
             time.sleep(2)
 
     print("\n=== Results ===")
@@ -74,9 +76,10 @@ def main():
         if p.exists():
             data = json.loads(p.read_text())
             print(f"  {p.name}:")
-            print(f"    mean_faithfulness={data.get('mean_faithfulness')}  "
-                  f"pass_rate={data.get('pass_rate_at_0_90')}  "
-                  f"avg_loops={data.get('avg_loop_count')}  "
+            print(f"    mean_sim={data.get('mean_semantic_similarity')}  "
+                  f"mean_cov={data.get('mean_coverage')}  "
+                  f"pass_rate={data.get('pass_rate_sim70_cov60')}  "
+                  f"errors={data.get('errors')}  "
                   f"p50={data.get('p50_latency_ms')}ms")
         else:
             print(f"  {p.name}: MISSING")

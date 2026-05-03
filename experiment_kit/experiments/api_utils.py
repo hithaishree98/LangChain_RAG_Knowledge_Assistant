@@ -13,10 +13,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 def _wait_for_api(port: int = 8000, timeout: int = 420) -> bool:
     """Poll /health until the API reports ready.
 
-    Readiness now includes pre-loading the 440MB nomic-embed model and the
-    cross-encoder during lifespan startup. On a cold disk cache that can take
-    3-5 minutes; 7 min gives generous headroom. Previously the model loaded
-    lazily on first upload, hiding the cold-start cost inside request timeouts.
+    Readiness includes pre-loading the embedding model (OpenAI text-embedding-3-small
+    or MiniLM-L6-v2) and the cross-encoder reranker during lifespan startup. On a
+    cold disk cache that can take 3-5 minutes; 7 min gives generous headroom.
+    Previously the model loaded lazily on first upload, hiding the cold-start cost
+    inside request timeouts.
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -62,15 +63,19 @@ def assert_workspace_ready(user_id: str, expected_min_docs: int = 6,
     crashed mid-upload, the index could be partial and silently skew results.
     """
     api_key = os.getenv("API_KEY", "")
-    headers = {"X-API-Key": api_key} if api_key else {}
+    token = os.getenv("EVAL_TOKEN", "")
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if api_key:
+        headers["X-API-Key"] = api_key
     try:
-        r = requests.get(f"http://localhost:{port}/list-docs",
-                         params={"user_id": user_id},
+        r = requests.get(f"http://localhost:{port}/documents",
                          headers=headers, timeout=10)
     except Exception as e:
         raise RuntimeError(f"workspace check failed for {user_id}: {e}")
     if r.status_code != 200:
-        raise RuntimeError(f"list-docs {r.status_code} for {user_id}: {r.text[:200]}")
+        raise RuntimeError(f"/documents {r.status_code} for {user_id}: {r.text[:200]}")
     docs = r.json() if r.text else []
     if len(docs) < expected_min_docs:
         raise RuntimeError(

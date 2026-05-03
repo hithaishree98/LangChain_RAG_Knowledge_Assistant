@@ -1,7 +1,7 @@
 """
 Experiment 6b — Real cost measurement and tiktoken validation
 
-Runs real /brief requests, captures the LLM's actual token usage from the
+Runs real /query requests, captures the LLM's actual token usage from the
 response metadata, and compares against tiktoken's estimate (produced by
 experiment 6a).
 
@@ -77,13 +77,13 @@ def clear_log():
     TOKEN_LOG_FILE.touch()
 
 
-def run_query(query: str, user_id: str = "eval_full") -> dict:
-    """Call /brief with a single query. Returns the API response + wall-clock time."""
+def run_query(query: str, user_id: str = "eval-full") -> dict:
+    """Call /query with a single question. Returns the API response + wall-clock time."""
     t0 = time.perf_counter()
     try:
         r = requests.post(
-            f"{API_BASE}/brief",
-            json={"query": query, "customer_id": user_id},
+            f"{API_BASE}/query",
+            json={"question": query, "customer_id": user_id},
             headers=HEADERS,
             timeout=120,
         )

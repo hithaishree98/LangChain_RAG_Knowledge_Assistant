@@ -26,7 +26,14 @@ Phase 2: evaluate all three workspaces with CHUNKING_MODE=full RETRIEVAL_MODE=fu
 Usage:
     python experiment_kit/experiments/exp1_chunking.py
 
-Requires: GROQ_API_KEY set, api/requirements.txt installed.
+Requires: GOOGLE_API_KEY set, api/requirements.txt installed.
+
+Phase 2 note: all three chunking modes are evaluated with RETRIEVAL_MODE=full.
+For baseline and sentence modes (flat index, no parent chunks), the "full"
+retrieval path's fetch_parents() silently falls back to child chunks because
+no parent_chunk_id metadata is present. This means Phase 2 is not a pure
+chunking ablation — the retrieval path differs subtly between modes. Results
+reflect end-to-end config performance, not isolated chunking effect.
 """
 import csv
 import json
@@ -49,6 +56,7 @@ EVAL_RESULTS = KIT_ROOT / "eval_results"
 
 def bootstrap(user_id: str, wipe: bool = True):
     import bootstrap_upload as bu
+    bu.ensure_customer(user_id)
     if wipe:
         print(f"  [wipe] clearing existing docs for {user_id}")
         bu.wipe_existing(user_id)
@@ -75,15 +83,18 @@ def main():
     print("EXPERIMENT 1 — CHUNKING ABLATION")
     print("=" * 72)
 
+    import bootstrap_upload as _bu
+
     # Phase 1: index each chunking config
     for mode in ("baseline", "sentence", "full"):
-        user_id = f"eval_{mode}"
+        user_id = f"eval-{mode}"
         print(f"\n── Phase 1 [{mode}] ──")
         proc = start_api({"CHUNKING_MODE": mode, "RETRIEVAL_MODE": "full"})
         try:
             bootstrap(user_id, wipe=True)
         finally:
             stop_api(proc)
+            _bu._TOKEN = None  # JWT_SECRET regenerates on restart; cached token is invalid
             time.sleep(2)
 
     # Phase 2: run eval for each config (retrieval mode fixed to full)
@@ -92,7 +103,7 @@ def main():
     try:
         for mode in ("baseline", "sentence", "full"):
             print(f"\n  [eval:{mode}] running eval against user_id=eval_{mode}")
-            run_eval(f"eval_{mode}", mode)
+            run_eval(f"eval-{mode}", mode)
     finally:
         stop_api(proc)
 
@@ -104,9 +115,7 @@ def main():
             print(f"  {p.name}:")
             print(f"    semantic_sim={data.get('semantic_similarity_avg')}  "
                   f"coverage={data.get('key_facts_coverage_avg')}  "
-                  f"faithfulness={data.get('mean_faithfulness_score')}  "
-                  f"avg_loops={data.get('avg_loop_count')}  "
-                  f"recall@5={data.get('recall_at_5')}  "
+                  f"recall@1={data.get('recall_at_1')}  "
                   f"mrr={data.get('mrr')}  "
                   f"p50={data.get('p50_latency_ms')}ms")
         else:

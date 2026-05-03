@@ -1,0 +1,22 @@
+{
+  "run_metadata": {
+    "timestamp": "2026-05-02T13:59:55.260313+00:00",
+    "embedder_model": "sentence-transformers/all-MiniLM-L6-v2",
+    "chunking_config": null,
+    "eval_workspace": "eval-default",
+    "customer_id": "eval-full",
+    "query_url": "http://localhost:8000/query",
+    "thresholds": {
+      "sentence_sim_coverage": 0.6
+    }
+  },
+  "chunking_config": null,
+  "semantic_similarity_avg": 0.647,
+  "key_facts_coverage_avg": 0.357,
+  "recall_at_1": 0.6,
+  "mrr": 0.6,
+  "p50_latency_ms": 30686.0,
+  "p95_latency_ms": 51461.6,
+  "error_rate": 0.25,
+  "count": 15
+}

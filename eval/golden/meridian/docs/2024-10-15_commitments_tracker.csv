@@ -1,0 +1,5 @@
+commitment,promised_date,current_target_date,status,owner,customer_aware
+Sticky-session load balancer fix,2024-09-25,2024-09-25,open,eng-team,true
+Snowflake connector schema specification,2024-09-30,2024-09-30,open,data-team,true
+Plaid API migration,2025-01-01,2025-01-01,in_progress,integrations-team,true
+EU region availability (eu-west-1),2025-04-01,2025-04-01,in_progress,platform-team,true

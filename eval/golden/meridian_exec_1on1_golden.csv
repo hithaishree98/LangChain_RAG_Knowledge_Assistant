@@ -1,0 +1,8 @@
+person_name,section,expected_content,key_facts
+"Sarah Chen","role_and_tenure","VP Engineering or executive sponsor at Meridian","VP;Engineering;executive sponsor"
+"Sarah Chen","recent_signals","Stated that if September 25 login fix slips it becomes executive escalation","September 25;executive escalation;slips"
+"Sarah Chen","open_asks","Requested daily update emails on TICK-4521 status until resolution","daily updates;TICK-4521;email"
+"David Park","role_and_tenure","Technical lead or engineering contact at Meridian","technical lead;engineering"
+"David Park","recent_signals","Committed to login latency fix by September 25 with daily status updates","September 25;daily updates;login fix"
+"David Park","recent_signals","Committed to UK expansion feasibility document by October 31","UK feasibility;October 31"
+"David Park","open_asks","Requested Orion provide sticky-session timeout reduction to 3 minutes","sticky-session;3 minutes;timeout"

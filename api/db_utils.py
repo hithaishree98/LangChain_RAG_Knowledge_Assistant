@@ -8,7 +8,7 @@ _log = logging.getLogger(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
-DB_NAME = os.path.join(DATA_DIR, "rag_app.db")
+DB_NAME = os.getenv("RAG_DB_PATH") or os.path.join(DATA_DIR, "rag_app.db")
 MIGRATIONS_DIR = os.path.join(BASE_DIR, "migrations")
 
 
@@ -46,7 +46,21 @@ def run_migrations():
         _log.info("applying_migration filename=%s", filename)
         try:
             with open(filepath) as f:
-                conn.executescript(f.read())
+                sql = f.read()
+            # Run each statement individually so "duplicate column" errors on
+            # ALTER TABLE are skippable — happens when two migration files both
+            # try to add the same column (e.g. 005_add_doc_metadata.sql and
+            # 005_add_customers.sql both add doc_type to document_store).
+            statements = [s.strip() for s in sql.split(";") if s.strip()]
+            for stmt in statements:
+                try:
+                    conn.execute(stmt)
+                except sqlite3.OperationalError as se:
+                    msg = str(se).lower()
+                    if "duplicate column name" in msg or "already exists" in msg:
+                        _log.warning("migration_skip_duplicate stmt=%s...", stmt[:60])
+                    else:
+                        raise
             conn.execute("INSERT INTO schema_migrations (filename) VALUES (?)", (filename,))
             conn.commit()
             applied += 1
@@ -72,11 +86,11 @@ def insert_application_logs(session_id, user_query, gpt_response, model,
         conn.commit()
 
 
-def insert_document_record(filename, user_id="default"):
+def insert_document_record(filename, user_id="default", doc_type=None, doc_date=None):
     with get_db_connection() as conn:
         cursor = conn.execute(
-            "INSERT INTO document_store (filename, user_id) VALUES (?, ?)",
-            (filename, user_id)
+            "INSERT INTO document_store (filename, user_id, doc_type, doc_date) VALUES (?, ?, ?, ?)",
+            (filename, user_id, doc_type, doc_date)
         )
         file_id = cursor.lastrowid
         conn.commit()
@@ -178,4 +192,243 @@ def insert_brief_log(customer_id: str, query: str, brief_json: str,
         conn.commit()
 
 
+# ── Customer management ───────────────────────────────────────────────────────
+
+def create_customer(name: str, slug: str, fde_user_id: str) -> dict:
+    """Create a new customer workspace. Raises sqlite3.IntegrityError if slug exists."""
+    import sqlite3
+    with get_db_connection() as conn:
+        cursor = conn.execute(
+            "INSERT INTO customers (name, slug, fde_user_id) VALUES (?, ?, ?)",
+            (name, slug.lower().strip(), fde_user_id),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT id, name, slug, fde_user_id, last_call_date, created_at FROM customers WHERE id=?",
+            (cursor.lastrowid,)
+        ).fetchone()
+    return dict(row)
+
+
+def get_customers(fde_user_id: str) -> list:
+    _require_user_id(fde_user_id, "get_customers")
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, name, slug, last_call_date, created_at FROM customers WHERE fde_user_id=? ORDER BY name",
+            (fde_user_id,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_customer_by_slug(slug: str, fde_user_id: str) -> "dict | None":
+    _require_user_id(fde_user_id, "get_customer_by_slug")
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT id, name, slug, fde_user_id, last_call_date, created_at FROM customers WHERE slug=? AND fde_user_id=?",
+            (slug.lower().strip(), fde_user_id)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def delete_customer(slug: str, fde_user_id: str):
+    """Delete a customer and all associated DB records.
+
+    Returns list of document file_ids that were deleted (caller should clean Chroma),
+    or None if the customer was not found / not owned by fde_user_id.
+    """
+    _require_user_id(fde_user_id, "delete_customer")
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT id FROM customers WHERE slug=? AND fde_user_id=?",
+            (slug, fde_user_id)
+        ).fetchone()
+        if row is None:
+            return None
+        numeric_id = row["id"]
+
+        doc_rows = conn.execute(
+            "SELECT id FROM document_store WHERE user_id=?", (slug,)
+        ).fetchall()
+        file_ids = [r["id"] for r in doc_rows]
+
+        conn.execute("DELETE FROM people WHERE customer_id=?", (numeric_id,))
+        conn.execute("DELETE FROM document_store WHERE user_id=?", (slug,))
+        conn.execute("DELETE FROM customers WHERE id=?", (numeric_id,))
+        conn.commit()
+    return file_ids
+
+
+def update_last_call_date(customer_id: int, date_str: str) -> None:
+    with get_db_connection() as conn:
+        conn.execute(
+            "UPDATE customers SET last_call_date=? WHERE id=?",
+            (date_str, customer_id)
+        )
+        conn.commit()
+
+
+def get_corpus_health(customer_id: str) -> dict:
+    """Return per-doc-type health for a customer workspace."""
+    _require_user_id(customer_id, "get_corpus_health")
+    from datetime import datetime
+    from utils.doc_type_utils import VALID_DOC_TYPES
+    DOC_TYPES = sorted(VALID_DOC_TYPES)
+    STALE_DAYS = 30
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            """SELECT doc_type, MAX(doc_date) as last_upload, COUNT(*) as count
+               FROM document_store
+               WHERE user_id=? AND doc_type IS NOT NULL
+               GROUP BY doc_type""",
+            (customer_id,)
+        ).fetchall()
+
+    by_type = {r["doc_type"]: dict(r) for r in rows}
+
+    health = {}
+    missing = []
+    overall = "current"
+
+    for dt in DOC_TYPES:
+        if dt not in by_type:
+            health[dt] = {"last_upload": None, "count": 0, "status": "missing"}
+            missing.append(dt)
+            overall = "stale"
+        else:
+            info = by_type[dt]
+            last = info["last_upload"] or today
+            try:
+                days_old = (datetime.strptime(today, "%Y-%m-%d") -
+                            datetime.strptime(last, "%Y-%m-%d")).days
+            except Exception:
+                days_old = 0
+            status = "current" if days_old <= STALE_DAYS else "stale"
+            if status == "stale":
+                overall = "stale"
+            health[dt] = {"last_upload": last, "count": info["count"], "status": status}
+
+    # customer_id is a slug — query by slug, not by numeric id
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT last_call_date FROM customers WHERE slug=?",
+            (customer_id,)
+        ).fetchone()
+    last_call = dict(row)["last_call_date"] if row else None
+
+    return {
+        "doc_types": health,
+        "overall": overall if any(v["status"] != "missing" for v in health.values()) else "empty",
+        "last_call_date": last_call,
+        "missing_doc_types": missing,
+    }
+
+
+# ── Stakeholder / people ──────────────────────────────────────────────────────
+
+def add_person(customer_id: int, name: str, role: str = None, email: str = None) -> dict:
+    with get_db_connection() as conn:
+        cursor = conn.execute(
+            "INSERT INTO people (customer_id, name, role, email) VALUES (?, ?, ?, ?)",
+            (customer_id, name, role, email)
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT id, customer_id, name, role, email FROM people WHERE id=?",
+            (cursor.lastrowid,)
+        ).fetchone()
+    return dict(row)
+
+
+def get_people(customer_id: int) -> list:
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            "SELECT id, name, role, email, created_at FROM people WHERE customer_id=? ORDER BY name",
+            (customer_id,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_person_by_id(person_id: int, customer_id: str) -> "dict | None":
+    """Return person record only when they belong to the specified customer."""
+    with get_db_connection() as conn:
+        row = conn.execute(
+            """SELECT p.id, p.name, p.role, p.email
+               FROM people p
+               JOIN customers c ON c.id = p.customer_id
+               WHERE p.id=? AND c.slug=?""",
+            (person_id, customer_id)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+# ── Document versioning ───────────────────────────────────────────────────────
+
+def set_latest_version_flag(customer_id: str, doc_type: str, new_file_id: int) -> None:
+    """Flip is_latest_version=0 on all prior uploads of this doc_type for this customer,
+    then set is_latest_version=1 on the new file."""
+    version_group = f"{customer_id}::{doc_type}"
+    with get_db_connection() as conn:
+        conn.execute(
+            """UPDATE document_store SET is_latest_version=0
+               WHERE user_id=? AND doc_type=? AND id!=?""",
+            (customer_id, doc_type, new_file_id)
+        )
+        conn.execute(
+            """UPDATE document_store SET is_latest_version=1, doc_version_group=?
+               WHERE id=?""",
+            (version_group, new_file_id)
+        )
+        conn.commit()
+
+
+# ── Brief history and feedback ────────────────────────────────────────────────
+
+def get_brief_history(customer_id: str, limit: int = 20) -> list:
+    _require_user_id(customer_id, "get_brief_history")
+    with get_db_connection() as conn:
+        rows = conn.execute(
+            """SELECT id, customer_id, query, faithfulness_score, loop_count, created_at
+               FROM brief_logs WHERE customer_id=? ORDER BY created_at DESC LIMIT ?""",
+            (customer_id, limit)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def insert_brief_feedback(brief_log_id: int, customer_id: str,
+                           section: str, rating: int,
+                           flagged_claim: str = None) -> None:
+    with get_db_connection() as conn:
+        conn.execute(
+            """INSERT INTO brief_feedback (brief_log_id, customer_id, section, rating, flagged_claim)
+               VALUES (?, ?, ?, ?, ?)""",
+            (brief_log_id, customer_id, section, rating, flagged_claim)
+        )
+        conn.commit()
+
+
+def get_analytics(customer_id: str) -> dict:
+    _require_user_id(customer_id, "get_analytics")
+    with get_db_connection() as conn:
+        total_briefs = conn.execute(
+            "SELECT COUNT(*) as n FROM brief_logs WHERE customer_id=?", (customer_id,)
+        ).fetchone()["n"]
+
+        avg_faithfulness = conn.execute(
+            "SELECT AVG(faithfulness_score) as avg FROM brief_logs WHERE customer_id=?",
+            (customer_id,)
+        ).fetchone()["avg"] or 0.0
+
+        feedback = conn.execute(
+            """SELECT section, AVG(rating) as avg_rating, COUNT(*) as count
+               FROM brief_feedback WHERE customer_id=? GROUP BY section""",
+            (customer_id,)
+        ).fetchall()
+
+    return {
+        "total_briefs": total_briefs,
+        "avg_faithfulness": round(avg_faithfulness, 3),
+        "feedback_by_section": [dict(r) for r in feedback],
+    }
 

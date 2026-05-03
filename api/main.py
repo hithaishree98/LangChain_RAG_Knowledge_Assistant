@@ -4,30 +4,41 @@ import json
 import logging
 import os
 import secrets
-import uuid
-import csv
-import io
 import tempfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile, Depends, status
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 from fastapi.security.api_key import APIKeyHeader
 
 from pydantic_models import (
-    QueryInput, QueryResponse, DocumentInfo, DeleteFileRequest,
-    BriefRequest, BriefResponse,
+    PreMeetingBriefRequest, PreMeetingBrief,
+    ExecBriefRequest, ExecBrief,
+    QueryRequest, QueryResult,
+    CustomerCreate, CustomerResponse, CorpusHealth,
+    PersonCreate, BriefFeedback,
+    TokenRequest,
+    DocumentInfo, DeleteFileRequest,
 )
 from langchain_utils import llm_breaker
 from chroma_utils import index_document_to_chroma, delete_doc_from_chroma, vectorstore
 from db_utils import (
-    insert_application_logs, get_all_documents,
+    get_all_documents,
     insert_document_record, delete_document_record,
     get_query_stats, get_audit_log, run_migrations, insert_brief_log,
+    set_latest_version_flag,
+    create_customer, get_customers, get_customer_by_slug, delete_customer,
+    update_last_call_date, get_corpus_health,
+    add_person, get_people,
+    insert_brief_feedback,
 )
-from notification_utils import send_to_slack  # noqa: F401 — available for future Slack escalation wiring
+
+from utils.doc_type_utils import (
+    VALID_DOC_TYPES, infer_doc_type, validate_filename, extract_date_from_filename,
+)
 
 
 # ── Structured JSON logger ────────────────────────────────────────────────────
@@ -102,7 +113,32 @@ async def lifespan(_: FastAPI):
     except Exception as e:
         log.warning("warmup_failed", error=str(e),
                     note="models will lazy-load on first request")
+
+    # Start APScheduler for daily overdue digest
+    _scheduler = None
+    try:
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+        from scripts.daily_overdue_check import run as _run_overdue_check
+        _scheduler = AsyncIOScheduler()
+        _scheduler.add_job(_run_overdue_check, "cron", hour=8, minute=0,
+                           id="daily_overdue_check", replace_existing=True)
+        _scheduler.start()
+        log.info("scheduler_started")
+    except ImportError:
+        log.warning("apscheduler_not_installed scheduler_disabled")
+    except Exception as e:
+        log.warning("scheduler_start_failed", error=str(e))
+
     yield
+
+    # Graceful shutdown: let any running scheduled job finish before the process exits.
+    if _scheduler is not None:
+        try:
+            _scheduler.shutdown(wait=True)
+            log.info("scheduler_stopped")
+        except Exception as e:
+            log.warning("scheduler_shutdown_failed", error=str(e))
+
 
 app = FastAPI(title="FDE Assistant API", lifespan=lifespan)
 
@@ -111,7 +147,7 @@ ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:8501").split(",
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["Content-Type", "X-API-Key", "Authorization"],
 )
 
@@ -120,7 +156,8 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
-_limiter = Limiter(key_func=get_remote_address)
+_RATELIMIT_ENABLED = os.getenv("TESTING_DISABLE_RATELIMIT", "0") != "1"
+_limiter = Limiter(key_func=get_remote_address, enabled=_RATELIMIT_ENABLED)
 app.state.limiter = _limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -131,12 +168,9 @@ def _limit(rate: str):
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-CONFIDENCE_THRESHOLD = 0.4
 MAX_QUESTION_LENGTH = 1000
 MAX_FILE_SIZE_MB = 10
-ALLOWED_EXTENSIONS = [".pdf", ".docx", ".html", ".txt", ".json"]
-MAX_QUESTIONNAIRE_ROWS = 200
-QUESTIONNAIRE_SEMAPHORE = asyncio.Semaphore(5)
+ALLOWED_EXTENSIONS = [".pdf", ".docx", ".html", ".txt", ".json", ".csv"]
 
 # ── API-key auth ──────────────────────────────────────────────────────────────
 
@@ -241,10 +275,19 @@ def health_check():
     except Exception as e:
         checks["vector_store"] = f"error: {str(e)}"
     checks["llm_key"] = "ok" if os.getenv("GOOGLE_API_KEY") else "missing"
+    # Surface which embedding provider the API will use. "openai" = hosted
+    # (fast, requires OPENAI_API_KEY); "huggingface" = local sentence-transformer
+    # fallback (slower on CPU, free, no network). Either is healthy.
+    try:
+        from chroma_utils import get_embedding_provider
+        checks["embedding_provider"] = get_embedding_provider()
+    except Exception as e:
+        checks["embedding_provider"] = f"error: {str(e)[:60]}"
     checks["slack"] = "configured" if os.getenv("SLACK_WEBHOOK_URL") else "not configured"
     from langchain_utils import _CBState
     checks["circuit_breaker"] = llm_breaker.state.value
-    _OK_VALUES = {"ok", "configured", "not configured", _CBState.CLOSED.value}
+    _OK_VALUES = {"ok", "configured", "not configured", "openai", "huggingface",
+                  _CBState.CLOSED.value}
     all_ok = all(v in _OK_VALUES for v in checks.values())
     return {"status": "healthy" if all_ok else "degraded", "checks": checks}
 
@@ -253,10 +296,10 @@ def health_check():
 
 @app.post("/auth/token")
 @_limit("5/minute")
-async def get_token(request: Request, body: dict):  # request is used by slowapi for IP-based limiting
+async def get_token(request: Request, body: TokenRequest):  # request is used by slowapi for IP-based limiting
     """Issue a short-lived JWT for a workspace. user_id = sha256(workspace:passkey)."""
-    workspace = body.get("workspace", "").strip().lower()
-    passkey = body.get("passkey", "").strip()
+    workspace = body.workspace.strip().lower()
+    passkey = body.passkey.strip()
     if not workspace or not passkey:
         raise HTTPException(status_code=400, detail="workspace and passkey are required")
     raw = f"{workspace}:{passkey}"
@@ -265,231 +308,187 @@ async def get_token(request: Request, body: dict):  # request is used by slowapi
     return {"token": token, "user_id": user_id}
 
 
-# ── Brief (primary endpoint) ──────────────────────────────────────────────────
+# ── Customer CRUD ─────────────────────────────────────────────────────────────
 
-@app.post("/brief", response_model=BriefResponse, dependencies=[Depends(verify_api_key)])
-@_limit("10/minute")
-async def get_brief(request: Request, req: BriefRequest, user_id: str = Depends(get_current_user)):
-    """
-    Primary endpoint. Runs the LangGraph workflow and returns a structured
-    pre-call brief with citations, faithfulness score, and audit trail.
-    """
-    if not req.query.strip():
-        raise HTTPException(status_code=400, detail="query cannot be empty")
-
-    if llm_breaker.is_open():
-        raise HTTPException(status_code=503,
-            detail="AI service temporarily unavailable. Please try again later.")
-
-    customer_id = req.customer_id or user_id
-    log.info("brief_request", customer_id=customer_id, query_length=len(req.query))
-
+@app.post("/customers", response_model=CustomerResponse, dependencies=[Depends(verify_api_key)])
+async def create_customer_endpoint(req: CustomerCreate, user_id: str = Depends(get_current_user)):
+    """Create a new customer workspace scoped to the authenticated FDE."""
+    import sqlite3
     try:
-        from graph.workflow import run_workflow
-        state = await run_workflow(customer_id, req.query.strip())
+        row = create_customer(req.name, req.slug, fde_user_id=user_id)
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409,
+                            detail=f"Customer slug '{req.slug}' already exists.")
     except Exception as e:
-        log.error("brief_workflow_failed", error=str(e))
-        raise HTTPException(status_code=503,
-            detail=f"Brief generation failed: {str(e)}")
+        log.error("create_customer_failed", error=str(e), user_id=user_id)
+        raise HTTPException(status_code=500, detail="Failed to create customer.")
+    return CustomerResponse(**row)
 
-    brief = state.get("brief") or {}
-    faithfulness = brief.get("faithfulness_score", 0.0)
-    loop_count = state.get("iteration_count", 0)
-    sources = brief.get("sources", [])
-    suspicious = brief.get("suspicious_facts", [])
 
-    if suspicious:
-        log.warning("hallucination_suspected",
-            customer_id=customer_id, facts_not_in_context=suspicious)
-
+@app.get("/customers", response_model=List[CustomerResponse], dependencies=[Depends(verify_api_key)])
+async def list_customers(user_id: str = Depends(get_current_user)):
+    """List all customers belonging to the authenticated FDE."""
     try:
-        insert_brief_log(customer_id, req.query, json.dumps(brief), faithfulness, loop_count)
+        rows = get_customers(user_id)
     except Exception as e:
-        log.error("brief_log_failed", error=str(e))
-    log.info("brief_response", customer_id=customer_id,
-             faithfulness=faithfulness, loop_count=loop_count)
-
-    return BriefResponse(
-        brief=brief,
-        sources=sources,
-        faithfulness_score=faithfulness,
-        judge_status=brief.get("judge_status", "disabled"),
-        loop_count=loop_count,
-        audit_trail=state.get("audit_trail", []),
-    )
+        log.error("list_customers_failed", error=str(e), user_id=user_id)
+        raise HTTPException(status_code=500, detail="Failed to retrieve customers.")
+    return [CustomerResponse(**r) for r in rows]
 
 
-# ── Chat (stub — delegates to brief, returns prose summary) ──────────────────
-
-@app.post("/chat", response_model=QueryResponse, dependencies=[Depends(verify_api_key)])
-async def chat(query_input: QueryInput, user_id: str = Depends(get_current_user)):
-    """
-    Legacy chat endpoint kept for backwards compatibility.
-    Internally calls the /brief workflow and returns a prose summary.
-    """
-    question = query_input.question.strip()
-    if not question:
-        raise HTTPException(status_code=400, detail="Question cannot be empty.")
-    if len(question) > MAX_QUESTION_LENGTH:
-        raise HTTPException(status_code=400,
-            detail=f"Question too long. Maximum {MAX_QUESTION_LENGTH} characters.")
-
-    docs = get_all_documents(user_id=user_id)
-    if not docs:
-        return QueryResponse(
-            answer="No documents uploaded yet. Please upload some documents first.",
-            session_id=query_input.session_id or str(uuid.uuid4()),
-            model=query_input.model,
-            confidence=0.0,
-            sources=[],
-            escalated=True,
-        )
-
-    if llm_breaker.is_open():
-        raise HTTPException(status_code=503,
-            detail="AI service temporarily unavailable. Please try again later.")
-
-    session_id = query_input.session_id or str(uuid.uuid4())
-
+@app.delete("/customers/{slug}", dependencies=[Depends(verify_api_key)])
+async def delete_customer_endpoint(slug: str, user_id: str = Depends(get_current_user)):
+    """Delete a customer workspace and all associated data. Only the owning FDE may delete."""
     try:
-        from graph.workflow import run_workflow
-        state = await run_workflow(user_id, question)
+        file_ids = delete_customer(slug, user_id)
     except Exception as e:
-        llm_breaker.on_failure()
-        raise HTTPException(status_code=503,
-            detail="AI service temporarily unavailable. Please try again.")
-
-    brief = state.get("brief") or {}
-    faithfulness = brief.get("faithfulness_score", 0.0)
-
-    # Build a prose answer from the brief sections
-    answer_parts = []
-    if brief.get("issues"):
-        answer_parts.append("Issues: " + "; ".join(i["claim"] for i in brief["issues"][:3]))
-    if brief.get("risks"):
-        answer_parts.append("Risks: " + "; ".join(r["claim"] for r in brief["risks"][:3]))
-    if brief.get("talking_points"):
-        answer_parts.append("Key points: " + "; ".join(t["point"] for t in brief["talking_points"][:3]))
-    if not answer_parts:
-        answer_parts.append(brief.get("summary", "No findings."))
-    answer = "\n\n".join(answer_parts)
-
-    sources = [s["filename"] for s in brief.get("sources", [])]
-    escalated = faithfulness < CONFIDENCE_THRESHOLD
-
-    try:
-        insert_application_logs(
-            session_id, question, answer, query_input.model.value,
-            faithfulness, escalated, ", ".join(sources), user_id=user_id,
-        )
-    except Exception as e:
-        log.error("db_write_failed", session_id=session_id, error=str(e))
-
-    return QueryResponse(
-        answer=answer,
-        session_id=session_id,
-        model=query_input.model,
-        confidence=faithfulness,
-        sources=sources,
-        escalated=escalated,
-    )
-
-
-# ── Streaming chat (stub — streams brief summary) ────────────────────────────
-
-@app.post("/chat/stream", dependencies=[Depends(verify_api_key)])
-async def chat_stream(query_input: QueryInput, user_id: str = Depends(get_current_user)):
-    """Stream answer tokens for the brief. Final line: '---META---' + JSON metadata."""
-    question = query_input.question.strip()
-    if not question:
-        raise HTTPException(status_code=400, detail="Question cannot be empty.")
-
-    if llm_breaker.is_open():
-        raise HTTPException(status_code=503, detail="AI service temporarily unavailable.")
-
-    session_id = query_input.session_id or str(uuid.uuid4())
-
-    async def generate():
+        log.error("delete_customer_failed", slug=slug, error=str(e), user_id=user_id)
+        raise HTTPException(status_code=500, detail="Failed to delete customer.")
+    if file_ids is None:
+        raise HTTPException(status_code=404, detail=f"Customer '{slug}' not found.")
+    for file_id in file_ids:
         try:
-            from graph.workflow import run_workflow
-            state = await run_workflow(user_id, question)
+            delete_doc_from_chroma(file_id, user_id=slug)
         except Exception as e:
-            llm_breaker.on_failure()
-            yield json.dumps({"error": str(e), "session_id": session_id}) + "\n"
-            return
-
-        brief = state.get("brief") or {}
-        faithfulness = brief.get("faithfulness_score", 0.0)
-        sources = [s["filename"] for s in brief.get("sources", [])]
-        escalated = faithfulness < CONFIDENCE_THRESHOLD
-
-        # Stream the brief as plain text sections
-        if brief.get("summary"):
-            yield brief["summary"] + "\n\n"
-        for issue in brief.get("issues", []):
-            yield f"Issue: {issue['claim']}\n"
-        for risk in brief.get("risks", []):
-            yield f"Risk: {risk['claim']}\n"
-        for pt in brief.get("talking_points", []):
-            yield f"Talking point: {pt['point']}\n"
-
-        try:
-            insert_application_logs(
-                session_id, question,
-                brief.get("summary", ""),
-                query_input.model.value,
-                faithfulness, escalated, ", ".join(sources), user_id=user_id,
-            )
-        except Exception:
-            pass
-
-        meta = json.dumps({
-            "session_id": session_id,
-            "confidence": faithfulness,
-            "sources": sources,
-            "escalated": escalated,
-        })
-        yield f"\n---META---{meta}"
-
-    return StreamingResponse(generate(), media_type="text/plain")
+            log.warning("chroma_cleanup_partial", file_id=file_id, slug=slug, error=str(e))
+    log.info("customer_deleted", slug=slug, user_id=user_id, docs_removed=len(file_ids))
+    return {"deleted": True}
 
 
-# ── Document upload ───────────────────────────────────────────────────────────
+@app.get("/customers/{customer_id}/corpus-health", response_model=CorpusHealth,
+         dependencies=[Depends(verify_api_key)])
+async def get_corpus_health_endpoint(customer_id: str, user_id: str = Depends(get_current_user)):
+    """Return per-doc-type freshness for a customer's corpus."""
+    if get_customer_by_slug(customer_id, user_id) is None:
+        raise HTTPException(status_code=404, detail=f"Customer '{customer_id}' not found.")
+    try:
+        health = get_corpus_health(customer_id)
+    except Exception as e:
+        log.error("corpus_health_failed", customer_id=customer_id, error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to retrieve corpus health.")
+    return CorpusHealth(**health)
 
-@app.post("/upload-doc", dependencies=[Depends(verify_api_key)])
-@_limit("10/minute")
-async def upload_and_index_document(
-    request: Request,
-    file: UploadFile = File(...),
-    doc_type: str = "auto",
+
+@app.post("/customers/{customer_id}/people", dependencies=[Depends(verify_api_key)])
+async def add_person_endpoint(
+    customer_id: str,
+    req: PersonCreate,
     user_id: str = Depends(get_current_user),
 ):
+    """Add a stakeholder/person to a customer workspace."""
+    customer = get_customer_by_slug(customer_id, user_id)
+    if customer is None:
+        raise HTTPException(status_code=404,
+                            detail=f"Customer '{customer_id}' not found.")
+    customer_numeric_id = customer["id"]
+    try:
+        person = add_person(customer_numeric_id, req.name, req.role, req.email)
+    except Exception as e:
+        log.error("add_person_failed", customer_id=customer_id, error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to add person.")
+    return person
+
+
+@app.get("/customers/{customer_id}/people", dependencies=[Depends(verify_api_key)])
+def list_people_endpoint(
+    customer_id: str,
+    user_id: str = Depends(get_current_user),
+):
+    """List all stakeholders/people for a customer workspace."""
+    customer = get_customer_by_slug(customer_id, user_id)
+    if customer is None:
+        raise HTTPException(status_code=404, detail=f"Customer '{customer_id}' not found.")
+    try:
+        from db_utils import get_people
+        return get_people(customer["id"])
+    except Exception as e:
+        log.error("list_people_failed", customer_id=customer_id, error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to list people.")
+
+
+# ── Document upload (per-customer) ────────────────────────────────────────────
+
+@app.post("/customers/{customer_id}/upload", dependencies=[Depends(verify_api_key)])
+@_limit("20/minute")
+async def upload_document(
+    request: Request,
+    customer_id: str,
+    file: UploadFile = File(...),
+    doc_type: str = Form(None),
+    replace: str = Form("false"),
+    user_id: str = Depends(get_current_user),
+):
+    """Upload and index a document into a specific customer's corpus.
+
+    Filename must follow the convention: YYYY-MM-DD_<keyword>_<descriptor>.<ext>
+    doc_type is optional; when omitted it is inferred from the filename.
     """
-    Upload and index a document. Supports PDF, DOCX, HTML, TXT (transcripts),
-    and JSON (tickets). Set doc_type to 'transcript', 'ticket', 'pdf', or 'auto'
-    (infers from extension).
-    """
+    # 0. Ownership check
+    if get_customer_by_slug(customer_id, user_id) is None:
+        raise HTTPException(status_code=404, detail=f"Customer '{customer_id}' not found.")
+
+    # 1. Extension check
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(status_code=400,
             detail=f"Unsupported file type '{ext}'. Allowed: {', '.join(ALLOWED_EXTENSIONS)}")
 
+    # 2. Read and validate file size
     contents = await file.read()
-    size_mb = len(contents) / (1024 * 1024)
-
     if len(contents) == 0:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    size_mb = len(contents) / (1024 * 1024)
     if size_mb > MAX_FILE_SIZE_MB:
         raise HTTPException(status_code=400,
             detail=f"File too large ({size_mb:.1f}MB). Maximum is {MAX_FILE_SIZE_MB}MB.")
 
-    safe_name = os.path.basename(file.filename)
-    suffix = os.path.splitext(safe_name)[1]
+    # 3. Resolve doc_type
+    filename = os.path.basename(file.filename)
+    if doc_type:
+        try:
+            from utils.doc_type_utils import normalize_doc_type
+            doc_type = normalize_doc_type(doc_type)
+        except ValueError:
+            raise HTTPException(status_code=400,
+                detail=f"doc_type must be one of: {sorted(VALID_DOC_TYPES)}")
+    else:
+        doc_type = infer_doc_type(filename)
+        if doc_type is None:
+            raise HTTPException(status_code=400,
+                detail=(
+                    f"Cannot infer doc_type from filename '{filename}'. "
+                    f"For .json/.csv files, provide doc_type explicitly: "
+                    f"'ticket' or 'commitment_tracker'."
+                ))
 
-    existing = [doc["filename"] for doc in get_all_documents(user_id=user_id)]
-    if safe_name in existing:
-        raise HTTPException(status_code=409,
-            detail=f"'{safe_name}' already exists. Delete it first or rename the file.")
+    # 4. Validate filename convention
+    valid, err_msg = validate_filename(filename)
+    if not valid:
+        raise HTTPException(status_code=400, detail=err_msg)
+
+    # 5. Duplicate filename check
+    replace_existing = replace.lower() in ("true", "1", "yes")
+    existing_docs = get_all_documents(user_id=customer_id)
+    duplicate = next((d for d in existing_docs if d["filename"] == filename), None)
+    if duplicate:
+        if not replace_existing:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"A document named '{filename}' already exists for this customer. "
+                    f"Set replace=true to overwrite it."
+                ),
+            )
+        # Delete the old record so the new upload becomes the sole version
+        delete_doc_from_chroma(duplicate["id"], user_id=customer_id)
+        delete_document_record(duplicate["id"], user_id=customer_id)
+        log.info("upload_replaced_existing", filename=filename, old_file_id=duplicate["id"],
+                 customer_id=customer_id)
+
+    log.info("upload_started", filename=filename, customer_id=customer_id,
+             doc_type=doc_type, size_mb=round(size_mb, 2), user_id=user_id)
+
+    suffix = ext
     tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
     temp_path = tmp.name
 
@@ -497,91 +496,464 @@ async def upload_and_index_document(
         tmp.write(contents)
         tmp.close()
 
-        log.info("upload_started", filename=safe_name, size_mb=round(size_mb, 2),
-                 doc_type=doc_type)
-        file_id = insert_document_record(safe_name, user_id=user_id)
-        success = index_document_to_chroma(temp_path, file_id, user_id=user_id, filename=safe_name)
+        # 6. Extract doc_date from filename
+        doc_date = extract_date_from_filename(filename)
 
-        if not success:
-            # Pass user_id so the cleanup actually matches the row we just inserted.
-            # Without it, delete_document_record's user_id default ("default") leaves
-            # an orphan row in document_store with no Chroma vectors backing it.
-            delete_document_record(file_id, user_id=user_id)
+        # 7. Insert DB record
+        file_id = insert_document_record(
+            filename, user_id=customer_id, doc_type=doc_type, doc_date=doc_date
+        )
+
+        # 8. Index into Chroma — must succeed before we stamp the version flag.
+        # If we flagged first and indexing then failed, the DB record gets rolled
+        # back but the version flag already flipped prior uploads to is_latest=0,
+        # leaving the corpus without any "latest" version for this doc_type.
+        index_summary = index_document_to_chroma(
+            temp_path, file_id, user_id=customer_id, filename=filename, doc_type=doc_type
+        )
+
+        if not index_summary:
+            delete_document_record(file_id, user_id=customer_id)
             raise HTTPException(status_code=500,
-                detail=f"Failed to index '{file.filename}'. The file may be corrupted.")
+                detail=f"Failed to index '{filename}'. "
+                       f"The file may be empty after format-aware filtering, or corrupted.")
 
-        log.info("upload_success", filename=safe_name, file_id=file_id)
-        return {"message": f"'{safe_name}' uploaded successfully.", "file_id": file_id}
+        # 9. Mark this as the latest version only after indexing succeeds,
+        #    then demote prior Chroma chunks so retrieval filters stay in sync.
+        set_latest_version_flag(customer_id, doc_type, file_id)
+        try:
+            from chroma_utils import demote_old_versions_in_chroma
+            demote_old_versions_in_chroma(customer_id, doc_type, file_id)
+        except Exception as e:
+            log.warning("chroma_demotion_failed", customer_id=customer_id,
+                        doc_type=doc_type, file_id=file_id, error=str(e))
+
+        log.info("upload_success", filename=filename, file_id=file_id,
+                 customer_id=customer_id, **index_summary)
+
+        # 10. Invalidate cache for this customer
+        try:
+            from utils.cache_utils import invalidate_customer
+            invalidate_customer(customer_id)
+        except Exception as e:
+            log.warning("cache_invalidate_failed", customer_id=customer_id, error=str(e))
+
+        # 11. Notify on transcript upload (non-blocking)
+        if doc_type == "transcript":
+            async def _notify():
+                try:
+                    from notification_utils import notify_transcript_uploaded
+                    await notify_transcript_uploaded(customer_id, filename)
+                except Exception as exc:
+                    log.warning("transcript_notify_failed", customer_id=customer_id,
+                                filename=filename, error=str(exc))
+            asyncio.create_task(_notify())
+
+        return {
+            "file_id": file_id,
+            "filename": filename,
+            "doc_type": doc_type,
+            "doc_date": doc_date,
+            "chunks": index_summary.get("child_chunks", 0),
+        }
 
     except HTTPException:
         raise
     except Exception as e:
-        log.error("upload_error", filename=safe_name, error=str(e))
+        log.error("upload_error", filename=filename, customer_id=customer_id, error=str(e))
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
 
-# ── Document list / delete ────────────────────────────────────────────────────
+# ── Customer-scoped document list and delete ──────────────────────────────────
 
-@app.get("/list-docs", response_model=list[DocumentInfo])
-def list_documents(user_id: str = Depends(get_current_user)):
+@app.get("/customers/{customer_id}/documents", dependencies=[Depends(verify_api_key)])
+def list_customer_documents(
+    customer_id: str,
+    user_id: str = Depends(get_current_user),
+):
+    """List all documents uploaded to a specific customer workspace."""
+    if get_customer_by_slug(customer_id, user_id) is None:
+        raise HTTPException(status_code=404, detail=f"Customer '{customer_id}' not found.")
     try:
-        return get_all_documents(user_id=user_id)
+        return get_all_documents(user_id=customer_id)
     except Exception as e:
-        log.error("list_docs_error", error=str(e))
+        log.error("list_customer_docs_error", customer_id=customer_id, error=str(e))
         raise HTTPException(status_code=500, detail="Failed to retrieve documents.")
 
 
-@app.post("/delete-doc", dependencies=[Depends(verify_api_key)])
-def delete_document(request: DeleteFileRequest, user_id: str = Depends(get_current_user)):
-    # user_id is JWT-derived; we never trust a tenant id from the request body.
-    existing = get_all_documents(user_id=user_id)
-    if not any(doc["id"] == request.file_id for doc in existing):
-        raise HTTPException(status_code=404, detail="Document not found in your workspace.")
-
-    chroma_ok = delete_doc_from_chroma(request.file_id, user_id=user_id)
-    db_ok = delete_document_record(request.file_id, user_id=user_id)
-
+@app.delete("/customers/{customer_id}/documents/{file_id}", dependencies=[Depends(verify_api_key)])
+def delete_customer_document(
+    customer_id: str,
+    file_id: int,
+    user_id: str = Depends(get_current_user),
+):
+    """Delete a document from a specific customer workspace."""
+    if get_customer_by_slug(customer_id, user_id) is None:
+        raise HTTPException(status_code=404, detail=f"Customer '{customer_id}' not found.")
+    existing = get_all_documents(user_id=customer_id)
+    if not any(doc["id"] == file_id for doc in existing):
+        raise HTTPException(status_code=404, detail="Document not found in this customer workspace.")
+    chroma_ok = delete_doc_from_chroma(file_id, user_id=customer_id)
+    db_ok = delete_document_record(file_id, user_id=customer_id)
     if chroma_ok and db_ok:
-        log.info("delete_success", file_id=request.file_id)
+        log.info("customer_delete_success", file_id=file_id, customer_id=customer_id)
         return {"message": "Document deleted."}
     elif db_ok and not chroma_ok:
-        log.warning("delete_partial", file_id=request.file_id)
-        return {"warning": "Removed from database but failed to remove from vector store."}
+        log.warning("customer_delete_partial", file_id=file_id, customer_id=customer_id)
+        return {"message": "Document removed. Vector store cleanup incomplete.", "partial": True}
     else:
         raise HTTPException(status_code=500, detail="Failed to delete document.")
 
 
-# ── Analytics / audit / logs ──────────────────────────────────────────────────
+# ── Brief: pre-meeting ────────────────────────────────────────────────────────
 
-@app.get("/analytics", dependencies=[Depends(verify_api_key)])
-def get_analytics(user_id: str = Depends(get_current_user)):
+@app.post("/brief/pre-meeting", dependencies=[Depends(verify_api_key)])
+@_limit("10/minute")
+async def pre_meeting_brief(
+    request: Request,
+    req: PreMeetingBriefRequest,
+    user_id: str = Depends(get_current_user),
+):
+    """Generate a structured pre-meeting brief for a customer."""
+    if llm_breaker.is_open():
+        raise HTTPException(status_code=503,
+            detail="AI service temporarily unavailable. Please try again later.")
+
+    as_of_date = req.as_of_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # Check cache
+    try:
+        from utils.cache_utils import get_cached, set_cached
+        cached = get_cached(req.customer_id, as_of_date, "pre_meeting")
+        if cached is not None:
+            log.info("pre_meeting_cache_hit", customer_id=req.customer_id, as_of_date=as_of_date)
+            return cached
+    except Exception as e:
+        log.warning("cache_read_failed", error=str(e))
+
+    # Verify ownership and get last_call_date
+    customer = get_customer_by_slug(req.customer_id, user_id)
+    if customer is None:
+        raise HTTPException(status_code=404, detail=f"Customer '{req.customer_id}' not found.")
+    last_call_date = customer.get("last_call_date")
+
+    log.info("pre_meeting_brief_start", customer_id=req.customer_id, as_of_date=as_of_date,
+             last_call_date=last_call_date)
+
+    try:
+        from graph.workflow import run_pre_meeting_workflow
+        final_state = await run_pre_meeting_workflow(
+            req.customer_id, as_of_date, last_call_date
+        )
+    except Exception as e:
+        log.error("pre_meeting_workflow_failed", customer_id=req.customer_id, error=str(e))
+        raise HTTPException(status_code=503,
+            detail=f"Brief generation failed: {str(e)}")
+
+    # Build brief object
+    brief = final_state.get("brief")
+    if brief is None:
+        brief = PreMeetingBrief(
+            as_of_date=as_of_date,
+            section_status=final_state.get("section_status", {}),
+        )
+
+    # Convert to dict for storage and response
+    if hasattr(brief, "model_dump"):
+        brief_dict = brief.model_dump()
+    else:
+        brief_dict = brief if isinstance(brief, dict) else {}
+
+    # Log to DB
+    try:
+        insert_brief_log(req.customer_id, "pre_meeting", json.dumps(brief_dict))
+    except Exception as e:
+        log.error("brief_log_failed", customer_id=req.customer_id, error=str(e))
+
+    # Cache the result
+    try:
+        set_cached(req.customer_id, as_of_date, "pre_meeting", brief_dict)
+    except Exception as e:
+        log.warning("cache_write_failed", error=str(e))
+
+    log.info("pre_meeting_brief_complete", customer_id=req.customer_id, as_of_date=as_of_date)
+    return brief_dict
+
+
+# ── Brief: exec 1:1 ──────────────────────────────────────────────────────────
+
+@app.post("/brief/exec-1on1", dependencies=[Depends(verify_api_key)])
+@_limit("10/minute")
+async def exec_1on1_brief(
+    request: Request,
+    req: ExecBriefRequest,
+    user_id: str = Depends(get_current_user),
+):
+    """Generate an exec 1:1 brief for a specific person at a customer."""
+    if llm_breaker.is_open():
+        raise HTTPException(status_code=503,
+            detail="AI service temporarily unavailable. Please try again later.")
+
+    as_of_date = req.as_of_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # Check cache
+    cache_key = f"exec_{req.person_id}"
+    try:
+        from utils.cache_utils import get_cached, set_cached
+        cached = get_cached(req.customer_id, as_of_date, cache_key)
+        if cached is not None:
+            log.info("exec_1on1_cache_hit", customer_id=req.customer_id, person_id=req.person_id)
+            return cached
+    except Exception as e:
+        log.warning("cache_read_failed", error=str(e))
+
+    # Verify ownership and get last_call_date
+    customer = get_customer_by_slug(req.customer_id, user_id)
+    if customer is None:
+        raise HTTPException(status_code=404, detail=f"Customer '{req.customer_id}' not found.")
+    last_call_date = customer.get("last_call_date")
+
+    # Verify person belongs to this customer (prevents cross-customer data access)
+    try:
+        from db_utils import get_person_by_id
+        person = get_person_by_id(int(req.person_id), req.customer_id)
+    except (ValueError, TypeError):
+        person = None
+    if person is None:
+        raise HTTPException(status_code=404,
+            detail=f"Person '{req.person_id}' not found for customer '{req.customer_id}'.")
+
+    log.info("exec_1on1_brief_start", customer_id=req.customer_id, person_id=req.person_id,
+             as_of_date=as_of_date)
+
+    try:
+        from graph.workflow import run_exec_1on1_workflow
+        final_state = await run_exec_1on1_workflow(
+            req.customer_id, req.person_id, as_of_date, last_call_date
+        )
+    except Exception as e:
+        log.error("exec_1on1_workflow_failed", customer_id=req.customer_id,
+                  person_id=req.person_id, error=str(e))
+        raise HTTPException(status_code=503,
+            detail=f"Exec brief generation failed: {str(e)}")
+
+    result = final_state.get("exec_brief_result") or {}
+
+    # Log to DB
+    try:
+        insert_brief_log(req.customer_id, f"exec_1on1:{req.person_id}", json.dumps(result))
+    except Exception as e:
+        log.error("brief_log_failed", customer_id=req.customer_id, error=str(e))
+
+    # Cache
+    try:
+        set_cached(req.customer_id, as_of_date, cache_key, result)
+    except Exception as e:
+        log.warning("cache_write_failed", error=str(e))
+
+    log.info("exec_1on1_brief_complete", customer_id=req.customer_id, person_id=req.person_id)
+    return result
+
+
+# ── Query ─────────────────────────────────────────────────────────────────────
+
+@app.post("/query", dependencies=[Depends(verify_api_key)])
+@_limit("20/minute")
+async def query(
+    request: Request,
+    req: QueryRequest,
+    user_id: str = Depends(get_current_user),
+):
+    """Single-pass focused Q&A against a customer's corpus."""
+    if not req.question.strip():
+        raise HTTPException(status_code=400, detail="question cannot be empty")
+
+    if not req.customer_id:
+        raise HTTPException(status_code=400,
+            detail="customer_id is required. Pass the customer slug in the request body.")
+
+    if llm_breaker.is_open():
+        raise HTTPException(status_code=503,
+            detail="AI service temporarily unavailable. Please try again later.")
+
+    # Verify the requested customer belongs to the authenticated FDE.
+    customer = get_customer_by_slug(req.customer_id, user_id)
+    if customer is None:
+        raise HTTPException(status_code=404,
+            detail=f"Customer '{req.customer_id}' not found.")
+
+    customer_id = req.customer_id
+    log.info("query_request", customer_id=customer_id, question_length=len(req.question))
+
+    try:
+        from graph.workflow import run_query_workflow
+        final_state = await run_query_workflow(customer_id, req.question.strip())
+    except Exception as e:
+        log.error("query_workflow_failed", customer_id=customer_id, error=str(e))
+        raise HTTPException(status_code=503, detail=f"Query failed: {str(e)}")
+
+    payload = final_state.get("lookup_response")
+    if not payload:
+        log.error("query_empty_response", customer_id=customer_id)
+        raise HTTPException(status_code=503, detail="Query workflow returned no result.")
+    log.info("query_response", customer_id=customer_id,
+             answer_status=payload.get("answer_status", "?"))
+    return payload
+
+
+# ── Brief feedback ────────────────────────────────────────────────────────────
+
+@app.post("/brief/feedback", dependencies=[Depends(verify_api_key)])
+async def brief_feedback(req: BriefFeedback, user_id: str = Depends(get_current_user)):
+    """Record thumbs-up/down feedback on a brief section."""
+    try:
+        insert_brief_feedback(req.brief_log_id, req.customer_id, req.section, req.rating, req.flagged_claim)
+    except Exception as e:
+        log.error("brief_feedback_failed", brief_log_id=req.brief_log_id, error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to record feedback.")
+    return {"status": "recorded"}
+
+
+# ── Deprecated endpoints → 410 Gone ──────────────────────────────────────────
+
+@app.post("/brief")
+async def brief_deprecated():
+    raise HTTPException(status_code=410,
+        detail="Use POST /brief/pre-meeting or POST /brief/exec-1on1")
+
+
+@app.post("/lookup")
+async def lookup_deprecated():
+    raise HTTPException(status_code=410, detail="Use POST /query")
+
+
+@app.post("/chat")
+async def chat_deprecated():
+    raise HTTPException(status_code=410, detail="Use POST /query")
+
+
+# ── Documents: list / delete ──────────────────────────────────────────────────
+
+@app.get("/documents", response_model=List[DocumentInfo], dependencies=[Depends(verify_api_key)])
+def list_documents(user_id: str = Depends(get_current_user)):
+    """List all documents for the authenticated user's workspace."""
+    try:
+        return get_all_documents(user_id=user_id)
+    except Exception as e:
+        log.error("list_docs_error", error=str(e), user_id=user_id)
+        raise HTTPException(status_code=500, detail="Failed to retrieve documents.")
+
+
+@app.delete("/documents/{file_id}", dependencies=[Depends(verify_api_key)])
+def delete_document(file_id: int, user_id: str = Depends(get_current_user)):
+    """Delete a document and its Chroma vectors from the workspace."""
+    existing = get_all_documents(user_id=user_id)
+    if not any(doc["id"] == file_id for doc in existing):
+        raise HTTPException(status_code=404, detail="Document not found in your workspace.")
+
+    chroma_ok = delete_doc_from_chroma(file_id, user_id=user_id)
+    db_ok = delete_document_record(file_id, user_id=user_id)
+
+    if chroma_ok and db_ok:
+        log.info("delete_success", file_id=file_id, user_id=user_id)
+        return {"message": "Document deleted."}
+    elif db_ok and not chroma_ok:
+        log.warning("delete_partial", file_id=file_id, user_id=user_id)
+        return {"message": "Document removed. Vector store cleanup incomplete — re-indexing may help.",
+                "partial": True}
+    else:
+        raise HTTPException(status_code=500, detail="Failed to delete document.")
+
+
+# ── Stats / audit log ─────────────────────────────────────────────────────────
+
+@app.get("/stats", dependencies=[Depends(verify_api_key)])
+def get_stats(user_id: str = Depends(get_current_user)):
+    """Return query statistics for the authenticated user's workspace."""
     try:
         return get_query_stats(user_id=user_id)
     except Exception as e:
-        log.error("analytics_error", error=str(e))
-        raise HTTPException(status_code=500, detail="Failed to load analytics.")
+        log.error("stats_error", error=str(e), user_id=user_id)
+        raise HTTPException(status_code=500, detail="Failed to load stats.")
 
 
 @app.get("/audit-log", dependencies=[Depends(verify_api_key)])
 def audit_log(limit: int = 100, user_id: str = Depends(get_current_user)):
+    """Return recent audit log entries for the authenticated user's workspace."""
     try:
         return get_audit_log(user_id=user_id, limit=limit)
     except Exception as e:
-        log.error("audit_log_error", error=str(e))
+        log.error("audit_log_error", error=str(e), user_id=user_id)
         raise HTTPException(status_code=500, detail="Failed to load audit log.")
 
 
+@app.post("/upload-doc")
+async def upload_doc_deprecated():
+    raise HTTPException(status_code=410,
+        detail="Use POST /customers/{customer_id}/upload")
+
+
+@app.get("/list-docs")
+async def list_docs_deprecated():
+    raise HTTPException(status_code=410, detail="Use GET /documents")
+
+
+@app.post("/delete-doc")
+async def delete_doc_deprecated():
+    raise HTTPException(status_code=410, detail="Use DELETE /documents/{file_id}")
+
+
+@app.get("/analytics")
+async def analytics_deprecated():
+    raise HTTPException(status_code=410, detail="Use GET /stats")
+
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+
 @app.get("/logs", dependencies=[Depends(verify_api_key)])
-def get_logs(level: str = None, limit: int = 100):
+def get_logs(level: str = None,
+             limit: int = 100,
+             user_id: str = Depends(get_current_user)):
+    """Return recent log entries scoped to the caller's workspace.
+
+    Two behaviors that closed an earlier cross-tenant leak:
+      1. Tenant filter — only entries that carry a matching ``user_id`` or
+         ``customer_id`` (request-scoped event) are returned. Entries without
+         a tenant tag (server lifecycle / startup / system events) are
+         INCLUDED only for the unauthenticated dev "default" tenant; for any
+         real workspace they are stripped, since they may reference other
+         tenants' filenames or queries in passing.
+      2. Tail-only read — we read at most the last LOGS_READ_BYTES bytes of
+         app.log so a large log file can't OOM the API. Default ~512 KB.
+
+    Authentication:
+      - Bearer JWT REQUIRED to scope to a real workspace. Without it we fall
+        through to "default" which only contains untagged events.
+    """
     log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "app.log")
     if not os.path.exists(log_path):
         return {"logs": [], "total": 0}
 
-    with open(log_path, "r") as f:
-        lines = f.readlines()
+    LOGS_READ_BYTES = 512 * 1024  # 512 KB tail
+    LOGS_HARD_LIMIT = 500
+    limit = max(1, min(int(limit or 100), LOGS_HARD_LIMIT))
+
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - LOGS_READ_BYTES))
+            tail = f.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        log.error("logs_read_failed", error=str(e))
+        return {"logs": [], "total": 0}
+
+    lines = tail.splitlines()
+    if size > LOGS_READ_BYTES and lines:
+        lines = lines[1:]
 
     parsed = []
     for line in lines:
@@ -590,6 +962,14 @@ def get_logs(level: str = None, limit: int = 100):
         except Exception:
             continue
 
+    def _belongs_to_caller(entry: Dict[str, Any]) -> bool:
+        tag = entry.get("user_id") or entry.get("customer_id")
+        if user_id == "default":
+            return tag is None or tag == "default"
+        return tag == user_id
+
+    parsed = [e for e in parsed if _belongs_to_caller(e)]
+
     if level:
         parsed = [l for l in parsed if l.get("level") == level.upper()]
 
@@ -597,78 +977,11 @@ def get_logs(level: str = None, limit: int = 100):
     return {"logs": parsed, "total": len(parsed)}
 
 
-# ── Bulk questionnaire ────────────────────────────────────────────────────────
+@app.post("/answer-questionnaire")
+async def answer_questionnaire_deprecated():
+    raise HTTPException(status_code=410, detail="Use POST /query with individual questions instead.")
 
-@app.post("/answer-questionnaire", dependencies=[Depends(verify_api_key)])
-@_limit("2/minute")
-async def answer_questionnaire(
-    request: Request,
-    file: UploadFile = File(...),
-    user_id: str = Depends(get_current_user),
-):
-    if not file.filename.endswith(".csv"):
-        raise HTTPException(status_code=400, detail="Only CSV files are accepted.")
 
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="CSV file is empty.")
-
-    try:
-        reader = csv.DictReader(io.StringIO(content.decode("utf-8")))
-        rows = list(reader)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Could not parse CSV. Check file encoding.")
-
-    if not rows:
-        raise HTTPException(status_code=400, detail="CSV has no rows.")
-    if "question" not in rows[0]:
-        raise HTTPException(status_code=400, detail="CSV must have a 'question' column.")
-    if len(rows) > MAX_QUESTIONNAIRE_ROWS:
-        raise HTTPException(status_code=400,
-            detail=f"CSV too large. Maximum {MAX_QUESTIONNAIRE_ROWS} rows allowed.")
-
-    results = []
-
-    async def process_row(row):
-        question = row.get("question", "").strip()
-        if not question:
-            return None
-        async with QUESTIONNAIRE_SEMAPHORE:
-            try:
-                from graph.workflow import run_workflow
-                state = await run_workflow(user_id, question)
-                brief = state.get("brief") or {}
-                faithfulness = brief.get("faithfulness_score", 0.0)
-                sources = [s["filename"] for s in brief.get("sources", [])]
-                # Build a one-line answer from the brief
-                parts = [i["claim"] for i in brief.get("issues", [])[:2]]
-                parts += [r["claim"] for r in brief.get("risks", [])[:2]]
-                answer = "; ".join(parts) if parts else brief.get("summary", "No findings.")
-                return {
-                    "question": question,
-                    "answer": answer,
-                    "confidence": faithfulness,
-                    "sources": sources,
-                    "needs_review": faithfulness < CONFIDENCE_THRESHOLD,
-                    "error": None,
-                }
-            except Exception as e:
-                log.error("bulk_question_failed", question=question, error=str(e))
-                return {
-                    "question": question,
-                    "answer": "Failed to get answer — retry manually.",
-                    "confidence": 0.0,
-                    "sources": [],
-                    "needs_review": True,
-                    "error": str(e),
-                }
-
-    tasks = [process_row(row) for row in rows]
-    raw = await asyncio.gather(*tasks)
-    results = [r for r in raw if r is not None]
-
-    return {
-        "results": results,
-        "total": len(results),
-        "needs_review_count": sum(1 for r in results if r["needs_review"]),
-    }
+@app.post("/chat/stream")
+async def chat_stream_deprecated():
+    raise HTTPException(status_code=410, detail="Use POST /query instead.")

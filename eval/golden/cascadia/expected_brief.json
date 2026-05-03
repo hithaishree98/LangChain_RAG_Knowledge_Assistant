@@ -1,0 +1,10 @@
+{
+  "must_have_overdue_commitments": true,
+  "overdue_commitment_descriptions": ["SSO integration"],
+  "must_have_open_items": true,
+  "open_item_ticket_ids": ["TICK-4521", "TICK-4601"],
+  "account_summary_must_contain": "at-risk",
+  "recent_changes_window_days": 14,
+  "anticipated_question_topics": ["SSO", "us-east-2", "uptime"],
+  "posture_verbs_expected": ["Acknowledge", "Lead", "Defer", "Push"]
+}

@@ -1,0 +1,36 @@
+question,expected_answer_contains,expected_status,expected_source_contains
+What is the login latency issue at Meridian?,800ms,ok,transcript
+What is the peak login latency?,2400ms,ok,transcript
+What is causing the login latency?,sticky-session,ok,transcript
+When is the sticky-session fix due?,September 25,ok,commitments
+What is the status of TICK-M001?,open,ok,tickets
+What priority is TICK-M001?,P0,ok,tickets
+Who is assigned to TICK-M001?,eng-team,ok,tickets
+How often does David Park want updates?,"daily",ok,transcript
+What time does Rachel send daily updates?,9am,ok,notes
+Who is David Park at Meridian?,VP Engineering,ok,transcript
+Who is Priya Desai at Meridian?,Head of Data,ok,transcript
+What is the Plaid migration deadline?,January 2025,ok,commitments
+Why is the Plaid migration urgent?,contract expires,ok,transcript
+What is TICK-M002 about?,Plaid API,ok,tickets
+What is the priority of TICK-M002?,P1,ok,tickets
+When does the Plaid v2 contract expire?,January 2025,ok,transcript
+What is the Snowflake commitment?,schema specification,ok,commitments
+When is the Snowflake spec due to Priya?,September 30,ok,transcript
+What is TICK-M003 about?,Snowflake,ok,tickets
+What priority is TICK-M003?,P2,ok,tickets
+When is EU region availability planned?,April 2025,ok,commitments
+What region will Meridian's EU hosting use?,eu-west-1,ok,transcript
+Why does Meridian need EU region?,GDPR,ok,transcript
+Who asked about EU region?,David Park,ok,transcript
+Is the sticky-session fix commitment overdue?,overdue,ok,commitments
+Is the Snowflake spec commitment overdue?,overdue,ok,commitments
+What are the overdue commitments for Meridian?,sticky-session,ok,commitments
+Who was the FDE on the September 15 call?,Rachel,ok,transcript
+What is the customer sentiment for Meridian?,at-risk,ok,notes
+What are Meridian's P0 tickets?,TICK-M001,ok,tickets
+What is the next call date for Meridian?,October 20,ok,notes
+What was the main concern David Park raised?,latency,ok,transcript
+How are the login latency issues affecting Meridian?,trading floor,ok,transcript
+What is the recommended posture for the Meridian call?,Acknowledge,ok,
+Does Meridian have any commitments past their due date?,yes,ok,commitments

@@ -1,0 +1,12 @@
+Post-call notes - September 15 2024
+Account: Cascadia Inc
+Attendees: Sarah (FDE), John (Customer CTO)
+
+Key points:
+- Customer is unhappy with us-east-2 deployment issues (ongoing 3+ weeks)
+- SSO integration promised for Oct 1 - HIGH PRIORITY
+- SLA breach: uptime at 99.1% vs 99.9% committed
+- Action item: Send detailed update email by Friday Sep 20
+
+Customer sentiment: At-risk. John was visibly frustrated about the SSO delay.
+Next call: October 22, 2024

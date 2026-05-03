@@ -1,0 +1,11 @@
+section,expected_content,key_facts,gold_source
+open_items,"TICK-4521 login latency issue is in-progress; p95 latency at 2400ms; hotfix in staging; production rollout September 25","TICK-4521;2400ms;September 25;staging;hotfix",TICK-4521.json
+open_items,"UK feasibility document due October 31; assigned to David Park","UK feasibility;October 31;David Park",customer_call_2024_09_15.txt
+open_items,"Snowflake export format spec due September 30; assigned to Priya Desai","Snowflake;September 30;Priya Desai",customer_call_2024_09_15.txt
+outstanding_commitments,"SOC 2 Type II report slipped from June 30 to August 15","SOC 2;slipped;August 15",Q3_QBR_Notes.docx
+outstanding_commitments,"Predictive ETA early access slipped from September 30 to March 2025; customer not yet aware","Predictive ETA;slipped;March 2025;customer unaware",Q3_QBR_Notes.docx
+outstanding_commitments,"Multi-region failover due December 31","multi-region failover;December 31",Q3_QBR_Notes.docx
+anticipated_questions,"Seat expansion of 20-30 seats at $180/seat; adds $3600-$5400/month","20-30 seats;$180;$3600;$5400",Q3_QBR_Notes.docx
+anticipated_questions,"EU region launch April 2025 at $4000/month additional","EU region;April 2025;$4000",Q3_QBR_Notes.docx
+overdue_commitments,"Any commitments with target_date before today that are still open","overdue;target_date;open",Q3_QBR_Notes.docx
+recent_changes,"TICK-4602 duplicate invoice resolved; fixed idempotency keying to stripe_event_id","TICK-4602;duplicate invoice;stripe_event_id;resolved",TICK-4602.json

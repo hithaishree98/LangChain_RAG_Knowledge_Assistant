@@ -1,7 +1,7 @@
 """
 Experiment 5 — Per-node latency breakdown
 
-Starts the API with NODE_TIMING=1, fires all queries from eval_set.csv at /brief,
+Starts the API with NODE_TIMING=1, fires all queries from eval_set.csv at /query,
 then prints p50/p90/p95 per node (query_rewrite, retrieve, reason, completeness).
 
 Usage:
@@ -57,7 +57,7 @@ def main():
     })
 
     try:
-        print(f"[run] firing {len(questions)} queries at /brief\n")
+        print(f"[run] firing {len(questions)} queries at /query\n")
         print(f"{'#':>3}  {'wall_ms':>8}  {'status':>7}  query")
         print("-" * 80)
 
@@ -65,8 +65,8 @@ def main():
             t0 = time.perf_counter()
             try:
                 r = requests.post(
-                    f"{API_BASE}/brief",
-                    json={"query": q, "customer_id": "eval_full"},
+                    f"{API_BASE}/query",
+                    json={"question": q, "customer_id": "eval-full"},
                     headers=headers,
                     timeout=120,
                 )

@@ -1,0 +1,76 @@
+{
+  "commitments": [
+    {
+      "commitment_id": "COM-001",
+      "description": "Deliver SOC 2 Type II audit report to Meridian security team",
+      "promised_date": "2024-06-30",
+      "current_target_date": "2024-08-15",
+      "status": "slipped",
+      "owner": "Orion Compliance Team",
+      "source_doc": "Meridian_SOW_v2.pdf",
+      "source_section": "Section 7: Compliance obligations",
+      "last_updated": "2024-09-01",
+      "customer_aware": true
+    },
+    {
+      "commitment_id": "COM-002",
+      "description": "Resolve login latency regression — production rollout of hotfix",
+      "promised_date": "2024-09-25",
+      "current_target_date": "2024-09-25",
+      "status": "active",
+      "owner": "Mike Rodriguez",
+      "source_doc": "TICK-4521.json",
+      "source_section": "Resolution timeline",
+      "last_updated": "2024-09-15",
+      "customer_aware": true
+    },
+    {
+      "commitment_id": "COM-003",
+      "description": "Enable multi-region failover for Meridian tenant (us-west-2 DR promotion)",
+      "promised_date": "2024-12-31",
+      "current_target_date": "2024-12-31",
+      "status": "active",
+      "owner": "Orion Infrastructure",
+      "source_doc": "Q3_QBR_Notes.docx",
+      "source_section": "Infrastructure roadmap commitments",
+      "last_updated": "2024-09-15",
+      "customer_aware": true
+    },
+    {
+      "commitment_id": "COM-004",
+      "description": "Raise ingestion event cap from 200M to 500M per month at no additional cost for Q4",
+      "promised_date": "2024-10-01",
+      "current_target_date": "2024-10-01",
+      "status": "delivered",
+      "owner": "Orion Account Team",
+      "source_doc": "Q3_QBR_Notes.docx",
+      "source_section": "Commercial concessions",
+      "last_updated": "2024-10-02",
+      "customer_aware": true
+    },
+    {
+      "commitment_id": "COM-005",
+      "description": "Provide Predictive ETA feature early access to Meridian pilot group",
+      "promised_date": "2024-09-30",
+      "current_target_date": "2025-03-31",
+      "status": "slipped",
+      "owner": "Orion Product",
+      "source_doc": "Q3_QBR_Notes.docx",
+      "source_section": "Product roadmap commitments, slide 14",
+      "last_updated": "2024-09-15",
+      "customer_aware": false
+    },
+    {
+      "commitment_id": "COM-006",
+      "description": "Share daily status updates on TICK-4521 hotfix until production ship",
+      "promised_date": "2024-09-25",
+      "current_target_date": "2024-09-25",
+      "status": "delivered",
+      "owner": "David Park",
+      "source_doc": "TICK-4521.json",
+      "source_section": "Call commitments",
+      "last_updated": "2024-09-26",
+      "customer_aware": true
+    }
+  ]
+}

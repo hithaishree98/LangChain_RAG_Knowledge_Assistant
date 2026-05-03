@@ -1,0 +1,4 @@
+ticket_id,summary,status,priority,created_date,updated_date,reporter,assignee,description,resolution
+TICK-4521,us-east-2 deployment failing,open,P0,2024-09-01,2024-10-12,john@cascadia.com,eng-team,Deployment pipeline fails in us-east-2 region with timeout errors,
+TICK-4580,SSO integration request,in_progress,P1,2024-09-10,2024-10-15,john@cascadia.com,dev-team,Customer requesting SSO integration for their Okta instance,
+TICK-4601,Uptime below SLA threshold,open,P0,2024-10-01,2024-10-20,john@cascadia.com,sre-team,Uptime at 99.1% vs committed 99.9%,

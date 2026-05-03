@@ -4,6 +4,7 @@ import os
 import re
 import time
 import threading
+from typing import Optional
 import numpy as np
 from enum import Enum
 from dotenv import load_dotenv
@@ -64,19 +65,79 @@ class CircuitBreaker:
                 self.state = _CBState.OPEN
 
 
-llm_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30)
+llm_breaker = CircuitBreaker(failure_threshold=10, recovery_timeout=30)
+
+
+# ── LLM judge gating ──────────────────────────────────────────────────────────
+
+# Words that signal a relational claim ("X agreed", "Y promised") — these are
+# exactly the claims regex CAN'T verify and that an FDE will quote back to
+# customers. Always send these to the LLM judge regardless of confidence.
+_RELATIONAL_QUERY_RE = re.compile(
+    r"\b(agreed?|committed?|promised?|told|said|confirmed?|denied?|refused?|"
+    r"stated?|approved?|rejected?|escalated?)\b",
+    re.I,
+)
+
+
+def should_run_judge(query: str, faithfulness: float, n_claims: int,
+                     always_run: bool = False) -> bool:
+    """Decide whether to run Layer 3 (LLM judge) for a /lookup answer.
+
+    The /brief endpoint always runs the judge (briefs are speculative and
+    pre-call, so latency is acceptable). /lookup is in-call territory — we
+    skip Layer 3 when we have high confidence the answer is grounded AND no
+    relational verbs are involved.
+
+    Always run when:
+      - faithfulness < 0.7 (low confidence — must verify)
+      - query has a relational verb (high stakes, regex can't catch it)
+      - n_claims > 3 (complex answer — verify)
+      - always_run flag is True (brief path)
+    """
+    if always_run:
+        return True
+    if faithfulness < 0.7:
+        return True
+    if _RELATIONAL_QUERY_RE.search(query or ""):
+        return True
+    if n_claims > 3:
+        return True
+    return False
 
 
 # ── Faithfulness-based confidence (RAGAS metric) ──────────────────────────────
 
-# Calibrated against eval runs: 0.65 gives < 5% false-positive grounding rate.
-# Override via FAITHFULNESS_THRESHOLD env var if you re-calibrate on your own dataset.
-_FAITHFULNESS_THRESHOLD = float(os.getenv("FAITHFULNESS_THRESHOLD", "0.65"))
+# Threshold calibrated for the active embedding provider.
+# HuggingFace all-MiniLM-L6-v2 (normalize_embeddings=True) produces higher
+# dot-product scores (~0.7-0.9 for related pairs) than OpenAI text-embedding-3-small
+# (~0.4-0.7 for the same pairs). Using separate defaults avoids both false-positives
+# (threshold too low) and the current 0.0-always bug (threshold too high for OpenAI).
+# Override either via env var for custom calibration.
+_THRESHOLD_BY_PROVIDER = {"openai": 0.45, "huggingface": 0.65}
+_FAITHFULNESS_THRESHOLD = float(os.getenv("FAITHFULNESS_THRESHOLD", "0"))  # 0 = auto
+
+
+def _get_faithfulness_threshold() -> float:
+    if _FAITHFULNESS_THRESHOLD > 0:
+        return _FAITHFULNESS_THRESHOLD
+    from chroma_utils import get_embedding_provider
+    return _THRESHOLD_BY_PROVIDER.get(get_embedding_provider(), 0.50)
 
 
 def _cosine(a: tuple, b: tuple) -> float:
     """Dot product of two normalized embedding vectors = cosine similarity."""
     return float(np.dot(np.array(a), np.array(b)))
+
+
+def _safe_embed(text: str):
+    """Return embedding tuple, or None and log on failure."""
+    from chroma_utils import embed_cached
+    try:
+        return embed_cached(text)
+    except Exception as e:
+        _log.warning("embed_cached_failed: %s | text=%r", e, text[:60])
+        return None
 
 
 def calculate_faithfulness(answer: str, retrieved_docs) -> float:
@@ -89,18 +150,19 @@ def calculate_faithfulness(answer: str, retrieved_docs) -> float:
     if not retrieved_docs:
         return 0.0
 
-    from chroma_utils import embed_cached
-
     sentences = [s.strip() for s in re.split(r"[.!?]", answer) if len(s.strip()) > 20]
     if not sentences:
         return 0.0
 
-    chunk_embs = [embed_cached(doc.page_content[:300]) for doc in retrieved_docs]
+    chunk_embs = [e for e in (_safe_embed(doc.page_content[:800]) for doc in retrieved_docs) if e is not None]
+    if not chunk_embs:
+        return 0.0
 
+    threshold = _get_faithfulness_threshold()
     grounded = 0
     for sentence in sentences:
-        s_emb = embed_cached(sentence)
-        if any(_cosine(s_emb, c_emb) >= _FAITHFULNESS_THRESHOLD for c_emb in chunk_embs):
+        s_emb = _safe_embed(sentence)
+        if s_emb is not None and any(_cosine(s_emb, c_emb) >= threshold for c_emb in chunk_embs):
             grounded += 1
 
     return round(grounded / len(sentences), 2)
@@ -179,7 +241,13 @@ def classify_claims(claim_texts: list, retrieved_docs) -> dict:
 
         # Check if the claim contains relational assertions — even if atomic facts
         # match, the relationship between them may still be hallucinated.
-        has_relational = any(verb in claim_lower.split() for verb in _RELATIONAL_VERBS)
+        # Use whole-string `in` (not `.split()`) so multi-word verbs like
+        # "reports to" also match. The previous `.split()` membership check
+        # would silently miss any space-containing entry in _RELATIONAL_VERBS.
+        # We pad with spaces to avoid spurious sub-word matches (e.g. "raised"
+        # would otherwise match against "praised" / "appraised").
+        padded = f" {claim_lower} "
+        has_relational = any(f" {verb} " in padded for verb in _RELATIONAL_VERBS)
 
         # Routing logic
         if has_regex_facts and not unsupported and not has_relational:
@@ -219,7 +287,7 @@ def detect_hallucination(answer: str, retrieved_docs) -> list:
 _JUDGE_PROMPT = """ROLE:
 You are a strict fact-verification judge with zero tolerance for unverified claims.
 
-TASK:
+TASK A — CLAIM VERIFICATION:
 For each CLAIM below, determine if it is fully supported by the CONTEXT.
 A claim is SUPPORTED only when EVERY assertion in it — every name, relationship,
 attribution, and fact — can be traced word-for-word or as an unambiguous paraphrase
@@ -240,36 +308,67 @@ RULES (apply ALL of them):
 6. DEFAULT: When in doubt, mark UNSUPPORTED. False positives (over-flagging) are safer than
    false negatives (missing a hallucination).
 
-CONTEXT:
-{context}
+TASK B — CONFLICT DETECTION:
+After verifying the claims, scan the context chunks against each other.
+Identify cases where two chunks assert contradictory facts about the same topic, e.g.:
+  - One chunk says a project is "on track", another says it is "slipping"
+  - Different dates for the same deadline or promised delivery
+  - Different owners, statuses, or agreed terms for the same item
 
-CLAIMS TO JUDGE:
+Recency rule: if one chunk has a newer date in its header, its version is more likely
+correct. Set recommendation to "trust_newer" in that case, otherwise "needs_verification".
+
+<context>
+{context}
+</context>
+
+<claims_to_judge>
 {claims_numbered}
+</claims_to_judge>
 
 OUTPUT:
-Return ONLY a JSON array, one object per claim in the same order, with:
-  - "index": the claim number (1-indexed, matching input)
-  - "verdict": "supported" or "unsupported"
-  - "reason": one short sentence explaining the verdict (quote the exact mismatch when flagging)
+Return ONLY a single JSON object (not an array) with two keys:
 
-Example output:
-[
-  {{"index": 1, "verdict": "supported", "reason": "Context explicitly states this."}},
-  {{"index": 2, "verdict": "unsupported", "reason": "Name 'Sarah Park' does not appear in context; context names 'Sarah Chen'."}}
-]
+{{
+  "verdicts": [
+    {{"index": 1, "verdict": "supported", "reason": "Context explicitly states this."}},
+    {{"index": 2, "verdict": "unsupported", "reason": "Name 'Sarah Park' does not appear in context; context names 'Sarah Chen'."}}
+  ],
+  "conflicts": [
+    {{
+      "topic": "brief description of what the conflict is about",
+      "source_a": {{"chunk_id": "chunk 1", "claim": "what this chunk says"}},
+      "source_b": {{"chunk_id": "chunk 3", "claim": "what this chunk says"}},
+      "recommendation": "trust_newer | needs_verification"
+    }}
+  ]
+}}
 
-Return the JSON array only. No prose before or after."""
+If no conflicts are found, return "conflicts": [].
+Return the JSON object only. No prose before or after."""
 
 def _llm_invoke_with_retry(llm, prompt, max_retries: int = 3):
     """Invoke LLM, sleeping and retrying on 429 / quota / rate-limit responses.
 
     Covers error-message shapes from both Groq ("try again in 6.5s") and
     Gemini ("ResourceExhausted", "quota", "retry_delay { seconds: 20 }").
+
+    Always either returns the LLM response or raises — never silently returns
+    None. The defensive guard + final ``raise`` at the end of the function
+    ensure that even pathological inputs (max_retries < 1, or a future loop
+    refactor) can't produce a None that crashes callers with an opaque
+    AttributeError on ``response.content``.
     """
+    if max_retries < 1:
+        raise ValueError(
+            f"_llm_invoke_with_retry requires max_retries >= 1, got {max_retries}"
+        )
+    last_exc: Optional[Exception] = None
     for attempt in range(max_retries):
         try:
             return llm.invoke(prompt)
         except Exception as e:
+            last_exc = e
             msg = str(e)
             low = msg.lower()
             is_rate_limit = (
@@ -287,6 +386,13 @@ def _llm_invoke_with_retry(llm, prompt, max_retries: int = 3):
                 time.sleep(wait)
             else:
                 raise
+    # Belt-and-braces: should be unreachable since the loop above either
+    # returns or raises on every iteration. Re-raise the last captured
+    # exception (or a synthetic one) so an opaque None can never propagate
+    # to callers like reason_node / answer_node which then crash on .content.
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("_llm_invoke_with_retry exhausted retries without success")
 
 
 def llm_judge_claims(claim_texts: list, retrieved_docs) -> dict:
@@ -308,7 +414,7 @@ def llm_judge_claims(claim_texts: list, retrieved_docs) -> dict:
     import time as _t
     _judge_start = _t.perf_counter()
 
-    def _log_and_return(unsupported, status):
+    def _log_and_return(unsupported, status, conflicts=None):
         """Helper so every return path logs timing consistently."""
         _judge_elapsed_ms = (_t.perf_counter() - _judge_start) * 1000
         try:
@@ -316,7 +422,7 @@ def llm_judge_claims(claim_texts: list, retrieved_docs) -> dict:
             _log_timing("llm_judge", _judge_elapsed_ms)
         except Exception:
             pass
-        return {"unsupported": unsupported, "status": status}
+        return {"unsupported": unsupported, "status": status, "conflicts": conflicts or []}
 
     if not claim_texts:
         return _log_and_return([], "no_claims")
@@ -357,17 +463,30 @@ def llm_judge_claims(claim_texts: list, retrieved_docs) -> dict:
         except Exception:
             pass
 
-        content = response.content.strip()
+        content = (response.content or "").strip()
 
-        # Strip markdown fences if present
-        if "```" in content:
-            content = content.split("```")[1].strip()
-            if content.startswith("json"):
-                content = content[4:].strip()
+        # Strip markdown fences using the same robust regex helper used by nodes.
+        try:
+            from graph.nodes import _strip_json
+            content = _strip_json(content)
+        except ImportError:
+            pass
 
-        verdicts = json.loads(content)
+        parsed = json.loads(content)
+
+        # The new prompt returns {"verdicts": [...], "conflicts": [...]}.
+        # Guard against the old array shape in case a cached/stale prompt fires.
+        if isinstance(parsed, list):
+            verdicts = parsed
+            conflicts_raw = []
+        elif isinstance(parsed, dict):
+            verdicts = parsed.get("verdicts", [])
+            conflicts_raw = parsed.get("conflicts", [])
+        else:
+            raise ValueError(f"judge returned unexpected type: {type(parsed).__name__}")
+
         if not isinstance(verdicts, list):
-            raise ValueError("judge did not return a list")
+            raise ValueError("judge 'verdicts' is not a list")
 
         llm_breaker.on_success()
 
@@ -384,13 +503,19 @@ def llm_judge_claims(claim_texts: list, retrieved_docs) -> dict:
                         "reason": v.get("reason", "Judge marked unsupported."),
                         "judge_verdict": "unsupported",
                     })
-        return _log_and_return(unsupported, "ok")
+
+        # Normalise conflicts list — drop malformed entries
+        conflicts = [
+            c for c in (conflicts_raw or [])
+            if isinstance(c, dict) and c.get("topic") and c.get("source_a") and c.get("source_b")
+        ]
+        return _log_and_return(unsupported, "ok", conflicts)
 
     except json.JSONDecodeError as e:
         llm_breaker.on_failure()
-        _log.error("llm_judge_json_parse_failed: %s | raw=%s", e, content[:200] if 'content' in dir() else "")
-        return _log_and_return([], "parse_error")
+        _log.error("llm_judge_json_parse_failed: %s | raw=%s", e, content[:200])
+        return _log_and_return([], "parse_error", [])
     except Exception as e:
         llm_breaker.on_failure()
         _log.error("llm_judge_claims_failed: %s", e)
-        return _log_and_return([], "error")
+        return _log_and_return([], "error", [])
