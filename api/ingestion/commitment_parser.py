@@ -33,6 +33,45 @@ import os
 from dataclasses import dataclass
 from typing import List
 
+# Statuses that mean the commitment is no longer active / needs no action.
+_TERMINAL_COMMITMENT_STATUSES = frozenset({
+    "delivered", "deferred", "closed", "resolved", "done",
+    "complete", "completed", "cancelled", "canceled", "won't_do",
+})
+
+# Map raw status strings (from user-supplied data) → canonical vocabulary.
+# Keys are lowercase; values are one of the canonical statuses.
+_COMMIT_STATUS_NORMALIZE = {
+    "wip":          "in_progress",
+    "in-progress":  "in_progress",
+    "in progress":  "in_progress",
+    "started":      "in_progress",
+    "working":      "in_progress",
+    "open":         "active",
+    "new":          "active",
+    "pending":      "active",
+    "on-hold":      "deferred",
+    "on_hold":      "deferred",
+    "blocked":      "deferred",
+    "hold":         "deferred",
+    "done":         "delivered",
+    "complete":     "delivered",
+    "completed":    "delivered",
+    "closed":       "delivered",
+    "resolved":     "delivered",
+    "fixed":        "delivered",
+    "cancelled":    "deferred",
+    "canceled":     "deferred",
+    "won't_do":     "deferred",
+    "wontdo":       "deferred",
+}
+
+
+def _normalize_commitment_status(raw: str) -> str:
+    """Map raw status to canonical value; unknown values pass through lowercased."""
+    cleaned = raw.strip().lower()
+    return _COMMIT_STATUS_NORMALIZE.get(cleaned, cleaned)
+
 
 @dataclass
 class Commitment:
@@ -40,13 +79,16 @@ class Commitment:
     description: str
     promised_date: str
     current_target_date: str
-    status: str           # active | open | in_progress | slipped | delivered | deferred
+    status: str           # canonical: active | in_progress | slipped | delivered | deferred
     owner: str
     source_doc: str
     source_section: str
     last_updated: str
     customer_aware: bool
-    is_slipped: bool = False  # True when current_target_date > promised_date
+    is_slipped: bool = False   # True when current_target_date > promised_date
+    is_open: bool = True       # False for terminal statuses (delivered, deferred, etc.)
+    is_overdue: bool = False   # True when current_target_date < today and is_open
+    days_overdue: int = 0      # Calendar days past target date; 0 when not overdue
 
 
 def _parse_bool(value) -> bool:
@@ -64,8 +106,13 @@ def _row_to_commitment(item: dict) -> Commitment:
     """
     # Normalise keys to lowercase so CSV headers don't need exact casing
     lower = {k.strip().lower(): v for k, v in item.items()}
-    # 'description' wins; fall back to 'commitment' column name
-    description = str(lower.get("description") or lower.get("commitment", ""))
+    # Resolve variant field names to canonical ones (e.g. "id" → "commitment_id").
+    # Canonical keys present in the original dict take priority over alias-mapped ones.
+    _aliased = {_COMMIT_ALIASES.get(k, k): v for k, v in lower.items()}
+    _aliased.update({k: v for k, v in lower.items() if k not in _COMMIT_ALIASES})
+    lower = _aliased
+    # After aliasing, "description" maps to "commitment" — check "commitment" first
+    description = str(lower.get("commitment") or lower.get("description", ""))
     promised_date = str(lower.get("promised_date", ""))
     current_target_date = str(lower.get("current_target_date", ""))
     # is_slipped: explicit field in JSON OR computed when target > promised
@@ -78,18 +125,20 @@ def _row_to_commitment(item: dict) -> Commitment:
             current_target_date and promised_date
             and current_target_date > promised_date
         )
+    status = _normalize_commitment_status(str(lower.get("status", "active")))
     return Commitment(
         commitment_id=str(lower.get("commitment_id", "")),
         description=description,
         promised_date=promised_date,
         current_target_date=current_target_date,
-        status=str(lower.get("status", "active")),
+        status=status,
         owner=str(lower.get("owner", "")),
         source_doc=str(lower.get("source_doc", "")),
         source_section=str(lower.get("source_section", "")),
         last_updated=str(lower.get("last_updated", "")),
         customer_aware=_parse_bool(lower.get("customer_aware", False)),
         is_slipped=is_slipped,
+        is_open=status not in _TERMINAL_COMMITMENT_STATUSES,
     )
 
 
@@ -145,20 +194,28 @@ from typing import Optional as _Optional, List as _List
 _COMMIT_REQUIRED = {"commitment", "status"}
 
 _COMMIT_ALIASES = {
+    # ── Commitment text ───────
     "description":      "commitment",
     "promise":          "commitment",
     "item":             "commitment",
     "task":             "commitment",
+    # ── Identifier ───────────
+    "id":               "commitment_id",
+    # ── Date fields ──────────
     "due_date":         "promised_date",
     "original_due":     "promised_date",
     "commit_date":      "promised_date",
     "target":           "current_target_date",
+    "target_date":      "current_target_date",
     "current_due":      "current_target_date",
     "revised_date":     "current_target_date",
     "updated_due":      "current_target_date",
+    "created_date":     "last_updated",
+    # ── People ───────────────
     "responsible":      "owner",
     "assignee":         "owner",
     "team":             "owner",
+    # ── Visibility ───────────
     "customer_visible": "customer_aware",
     "visible":          "customer_aware",
     "external":         "customer_aware",
@@ -174,6 +231,7 @@ class CommitmentRecord:
     owner: _Optional[str] = None
     customer_aware: bool = False
     is_slipped: bool = False   # computed: current_target_date > promised_date
+    is_open: bool = True       # False for terminal statuses
     commitment_id: str = ""
 
 
@@ -228,15 +286,17 @@ def parse_csv_sheets(file_path: str) -> _List[CommitmentRecord]:
             customer_aware = aware_raw in ("true", "yes", "1", "x")
 
             commitment_id = get("commitment_id") or f"C{row_num - 1:03d}"
+            status = _normalize_commitment_status(get("status") or "open")
 
             records.append(CommitmentRecord(
                 description=desc,
-                status=get("status").lower() or "open",
+                status=status,
                 promised_date=promised,
                 current_target_date=target,
                 owner=get("owner") or None,
                 customer_aware=customer_aware,
                 is_slipped=is_slipped,
+                is_open=status not in _TERMINAL_COMMITMENT_STATUSES,
                 commitment_id=commitment_id,
             ))
 
@@ -249,12 +309,27 @@ def _normalize_commit_date(s: str) -> _Optional[str]:
     if not s:
         return None
     from datetime import datetime
-    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%d-%b-%Y", "%Y/%m/%d"):
+    s = s.strip()
+    for fmt in (
+        "%Y-%m-%d",     # 2026-01-15
+        "%m/%d/%Y",     # 01/15/2026
+        "%d/%m/%Y",     # 15/01/2026
+        "%d-%b-%Y",     # 15-Jan-2026
+        "%Y/%m/%d",     # 2026/01/15
+        "%B %d, %Y",    # January 15, 2026  ← common in Google Sheets / Notion exports
+        "%d %B %Y",     # 15 January 2026
+    ):
         try:
-            return datetime.strptime(s.strip(), fmt).strftime("%Y-%m-%d")
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
         except (ValueError, TypeError):
             continue
-    return None  # unparseable date strings (e.g. "Q3 2024") are dropped rather than silently truncated
+    # ISO-8601 with time component: "2026-01-15T10:30:00Z" — strip to date only
+    if len(s) >= 10:
+        try:
+            return datetime.strptime(s[:10], "%Y-%m-%d").strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    return None  # unparseable strings (e.g. "Q3 2026") are dropped rather than silently truncated
 
 
 def _compute_slipped(promised: _Optional[str], target: _Optional[str]) -> bool:

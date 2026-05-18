@@ -367,6 +367,7 @@ class TestPostureNodeVerbValidation:
 class TestAccountSummaryWordCap:
     def test_over_100_words_gets_truncated(self):
         from unittest.mock import patch, MagicMock
+        from langchain_core.documents import Document
         from graph.nodes import account_summary_node
 
         long_text = " ".join([f"word{i}" for i in range(150)])
@@ -374,13 +375,18 @@ class TestAccountSummaryWordCap:
         class _FakeResp:
             def __init__(self, content): self.content = content
 
+        mock_doc = Document(
+            page_content="account status content for grounding",
+            metadata={"filename": "test.txt", "doc_date": "2024-01-01", "user_id": "test_customer"},
+        )
+        # Score 0.4 is below the 0.85 distance threshold, so grounding check passes
+        mock_search = MagicMock(return_value=[(mock_doc, 0.4)])
+
         state = {
             "customer_id": "test_customer",
             "audit_trail": [],
         }
-        mock_retriever = MagicMock()
-        mock_retriever.invoke.return_value = []
-        with patch("chroma_utils.get_retriever_for_user", return_value=mock_retriever):
+        with patch("chroma_utils.vectorstore.similarity_search_with_score", mock_search):
             with patch("graph.nodes._get_llm"):
                 with patch("graph.nodes._llm_invoke_with_retry",
                            return_value=_FakeResp(long_text)):

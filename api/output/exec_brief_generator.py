@@ -7,9 +7,12 @@ Detects stale sources (signal/ask doc older than 30 days) and surfaces conflicts
 from conflicts_raw populated by section nodes.
 """
 
+import logging
 from typing import Any, Dict, List
 
 from pydantic import BaseModel
+
+_log = logging.getLogger(__name__)
 
 from pydantic_models import (
     ExecBrief,
@@ -36,6 +39,7 @@ class _RawSignal(BaseModel):
     event: str = ""
     date: str = ""
     source_doc: str = ""
+    doc_date: str = ""  # date of the source document (may differ from event date)
 
 
 class _RawAsk(BaseModel):
@@ -43,6 +47,7 @@ class _RawAsk(BaseModel):
     date: str = ""
     status: str = "open"
     source_doc: str = ""
+    doc_date: str = ""  # date of the source document (may differ from ask date)
 
 
 def generate_exec_brief(state: Dict[str, Any]) -> ExecBrief:
@@ -90,8 +95,8 @@ def generate_exec_brief(state: Dict[str, Any]) -> ExecBrief:
             continue  # drop items with no source evidence
         source = SourceCitation(
             document=item.source_doc,
-            doc_date=item.date,
-            is_stale=_is_stale(item.date, as_of_date),
+            doc_date=item.doc_date or item.date,
+            is_stale=_is_stale(item.doc_date or item.date, as_of_date),
         )
         recent_signals.append(Signal(
             event=item.event,
@@ -112,8 +117,8 @@ def generate_exec_brief(state: Dict[str, Any]) -> ExecBrief:
             continue  # drop items with no source evidence
         source = SourceCitation(
             document=item.source_doc,
-            doc_date=item.date,
-            is_stale=_is_stale(item.date, as_of_date),
+            doc_date=item.doc_date or item.date,
+            is_stale=_is_stale(item.doc_date or item.date, as_of_date),
         )
         open_asks.append(Ask(
             ask=item.ask,
@@ -157,8 +162,8 @@ def generate_exec_brief(state: Dict[str, Any]) -> ExecBrief:
                     doc_date=sb_raw.get("doc_date") or "",
                 ),
             ))
-        except Exception:
-            pass
+        except Exception as e:
+            _log.warning("conflict_parse_failed: %s | raw=%r", e, raw)
 
     return ExecBrief(
         role_and_tenure=role_and_tenure,

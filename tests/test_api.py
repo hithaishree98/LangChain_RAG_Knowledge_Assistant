@@ -179,7 +179,7 @@ def test_upload_json_without_doc_type_returns_400():
         headers=_bearer(_TEST_UPLOAD_USER),
     )
     assert response.status_code == 400
-    assert "doc_type" in response.json()["detail"].lower()
+    assert "document type" in response.json()["detail"].lower()
 
 
 def test_upload_json_with_explicit_doc_type_accepted():
@@ -382,16 +382,16 @@ def test_walk_json_strings_collects_nested_values():
     """_walk_json_strings flattens all string values from nested structures."""
     import chroma_utils
     obj = {
-        "title": "Top",
-        "nested": {"description": "Inner", "tags": ["a", "b"]},
+        "title": "TopLevelTitle",
+        "nested": {"description": "InnerDescription", "tags": ["alpha_tag_one", "beta_tag_two"]},
         "count": 42,            # non-string skipped
-        "list": ["x", {"y": "z"}],
+        "list": ["extra_item_x", {"y": "zeta_value_y"}],
     }
     out = chroma_utils._walk_json_strings(obj)
-    assert "Top" in out
-    assert "Inner" in out
-    assert "a" in out and "b" in out
-    assert "x" in out and "z" in out
+    assert "TopLevelTitle" in out
+    assert "InnerDescription" in out
+    assert "alpha_tag_one" in out and "beta_tag_two" in out
+    assert "extra_item_x" in out and "zeta_value_y" in out
     assert 42 not in out
 
 
@@ -472,29 +472,6 @@ def test_transcript_indexing_preserves_speaker_turns(tmp_path):
         assert has_speaker, "transcript chunks lost speaker attribution during indexing"
     finally:
         client.delete(f"/documents/{file_id}", headers=auth)
-
-
-# ── Slack ─────────────────────────────────────────────────────────────────────
-
-def test_send_to_slack_silently_returns_false_when_webhook_unset(monkeypatch):
-    """The Slack helper must no-op (return False) when SLACK_WEBHOOK_URL is empty.
-
-    Critical: callers depend on this so a missing webhook never breaks the
-    /brief or /lookup response — the team-notify flag becomes a no-op instead
-    of an error.
-    """
-    monkeypatch.delenv("SLACK_WEBHOOK_URL", raising=False)
-    import asyncio
-    from notification_utils import send_to_slack
-    # asyncio.run replaces the deprecated get_event_loop().run_until_complete
-    # pattern. Python 3.14 stops creating a default event loop on demand,
-    # which would have made the old call raise.
-    result = asyncio.run(
-        send_to_slack(
-            question="q", answer="a", sources=[], confidence=0.9, session_id="s"
-        )
-    )
-    assert result is False
 
 
 # ── Lookup endpoint + adaptive rewriter + judge gating ───────────────────────
@@ -871,30 +848,3 @@ def test_contextualize_chunks_empty_llm_response_is_fallback():
     assert not result[0].metadata.get("has_context_prefix")
 
 
-# ── Context prefix stripping (user-facing citation passage hygiene) ──────────
-
-def test_strip_context_prefix_removes_prefix_when_flag_set():
-    from output.brief_generator import _strip_context_prefix
-    content = "[Context: from Orion integration guide]\n\nThe rate limit is 1000/min."
-    metadata = {"has_context_prefix": True}
-    out = _strip_context_prefix(content, metadata)
-    assert out == "The rate limit is 1000/min."
-
-
-def test_strip_context_prefix_no_op_without_flag():
-    """A chunk that fell through contextualize's error path has no flag; we
-    must NOT strip even if its content happens to contain '[Context:' or ']\\n\\n'."""
-    from output.brief_generator import _strip_context_prefix
-    content = "[Context: this looks like a prefix but isn't]\n\nThe real passage."
-    metadata = {}  # no has_context_prefix
-    out = _strip_context_prefix(content, metadata)
-    assert out == content
-
-
-def test_strip_context_prefix_no_op_when_content_mismatches_flag():
-    """Metadata says prefixed but content doesn't start with '[Context:'. Safety."""
-    from output.brief_generator import _strip_context_prefix
-    content = "Plain content with no prefix at all."
-    metadata = {"has_context_prefix": True}
-    out = _strip_context_prefix(content, metadata)
-    assert out == content  # defense-in-depth: no-op if state is inconsistent

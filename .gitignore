@@ -17,6 +17,10 @@ env/
 experiment_kit/eval_results/
 experiment_kit/__pycache__/
 
+
+.claude/
+.gitignore/
+
 # IDE / OS
 .vscode/
 .idea/

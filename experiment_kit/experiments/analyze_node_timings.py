@@ -1,5 +1,5 @@
 """
-exp5_analyze.py — aggregate per-node timings from api/data/node_timings.jsonl
+analyze_node_timings.py — aggregate per-node timings from api/data/node_timings.jsonl
 
 Reads the JSONL file emitted by the @_timed decorator in nodes.py and prints:
 count, sum, p50, p90, p95, p99, max — per node.

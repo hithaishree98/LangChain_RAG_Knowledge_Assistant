@@ -77,6 +77,12 @@ def parse_csv(file_path: str) -> List[TicketRecord]:
         for h in reader.fieldnames:
             normalized = h.lower().strip().replace(" ", "_")
             canonical = _ALIASES.get(normalized, normalized)
+            if canonical in col_map:
+                _log.warning(
+                    "column_collision: %r and %r both map to canonical name %r; keeping first",
+                    col_map[canonical], h, canonical,
+                )
+                continue
             col_map[canonical] = h
 
         missing = _REQUIRED - set(col_map.keys())
@@ -125,7 +131,7 @@ def _normalize_date(s: str) -> Optional[str]:
     from datetime import datetime
     formats = [
         "%Y-%m-%d",
-        "%m/%d/%Y",
+        "%m/%d/%Y",  # US locale assumed; "01/02" → Jan 2, not Feb 1
         "%d/%m/%Y",
         "%d-%b-%Y",
         "%Y/%m/%d",

@@ -1,5 +1,5 @@
 """
-exp11_brief_type.py — compare /brief/pre-meeting vs /brief/exec-1on1.
+eval_brief_types.py — compare /brief/pre-meeting vs /brief/exec-1on1.
 
 Each endpoint produces a structurally different brief for the same customer:
   /brief/pre-meeting — account-wide view: open items, commitments, posture
@@ -12,7 +12,7 @@ This experiment answers:
   4. Does /brief/exec-1on1 surface person-specific signals not in pre-meeting?
 
 Usage:
-    python experiment_kit/experiments/exp11_brief_type.py \
+    python experiment_kit/experiments/eval_brief_types.py \
         --customer cascadia-inc --person-id 42
 
 Requires: GOOGLE_API_KEY, API_KEY, EVAL_WORKSPACE, EVAL_PASSKEY set in env.

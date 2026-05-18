@@ -97,6 +97,17 @@ def insert_document_record(filename, user_id="default", doc_type=None, doc_date=
     return file_id
 
 
+def document_exists(file_id: int, user_id: str) -> bool:
+    """Check if a document exists in this workspace without fetching all records."""
+    _require_user_id(user_id, "document_exists")
+    with get_db_connection() as conn:
+        row = conn.execute(
+            "SELECT id FROM document_store WHERE id=? AND user_id=? LIMIT 1",
+            (file_id, user_id)
+        ).fetchone()
+    return row is not None
+
+
 def delete_document_record(file_id, user_id="default"):
     with get_db_connection() as conn:
         cursor = conn.execute(
@@ -169,6 +180,7 @@ def get_query_stats(user_id="default"):
 
 
 def get_audit_log(user_id="default", limit=100):
+    _require_user_id(user_id, "get_audit_log")
     with get_db_connection() as conn:
         rows = conn.execute(
             """SELECT session_id, user_query, gpt_response, model,
@@ -196,7 +208,6 @@ def insert_brief_log(customer_id: str, query: str, brief_json: str,
 
 def create_customer(name: str, slug: str, fde_user_id: str) -> dict:
     """Create a new customer workspace. Raises sqlite3.IntegrityError if slug exists."""
-    import sqlite3
     with get_db_connection() as conn:
         cursor = conn.execute(
             "INSERT INTO customers (name, slug, fde_user_id) VALUES (?, ?, ?)",
@@ -276,6 +287,7 @@ def get_corpus_health(customer_id: str) -> dict:
     STALE_DAYS = 30
     today = datetime.now().strftime("%Y-%m-%d")
 
+    # Single connection for both queries to use consistent WAL snapshot
     with get_db_connection() as conn:
         rows = conn.execute(
             """SELECT doc_type, MAX(doc_date) as last_upload, COUNT(*) as count
@@ -285,7 +297,13 @@ def get_corpus_health(customer_id: str) -> dict:
             (customer_id,)
         ).fetchall()
 
+        last_call_row = conn.execute(
+            "SELECT last_call_date FROM customers WHERE slug=?",
+            (customer_id,)
+        ).fetchone()
+
     by_type = {r["doc_type"]: dict(r) for r in rows}
+    last_call = dict(last_call_row)["last_call_date"] if last_call_row else None
 
     health = {}
     missing = []
@@ -293,9 +311,9 @@ def get_corpus_health(customer_id: str) -> dict:
 
     for dt in DOC_TYPES:
         if dt not in by_type:
+            # Missing means not yet uploaded — only mark stale for docs that exist but are old
             health[dt] = {"last_upload": None, "count": 0, "status": "missing"}
             missing.append(dt)
-            overall = "stale"
         else:
             info = by_type[dt]
             last = info["last_upload"] or today
@@ -309,14 +327,6 @@ def get_corpus_health(customer_id: str) -> dict:
                 overall = "stale"
             health[dt] = {"last_upload": last, "count": info["count"], "status": status}
 
-    # customer_id is a slug — query by slug, not by numeric id
-    with get_db_connection() as conn:
-        row = conn.execute(
-            "SELECT last_call_date FROM customers WHERE slug=?",
-            (customer_id,)
-        ).fetchone()
-    last_call = dict(row)["last_call_date"] if row else None
-
     return {
         "doc_types": health,
         "overall": overall if any(v["status"] != "missing" for v in health.values()) else "empty",
@@ -329,11 +339,14 @@ def get_corpus_health(customer_id: str) -> dict:
 
 def add_person(customer_id: int, name: str, role: str = None, email: str = None) -> dict:
     with get_db_connection() as conn:
-        cursor = conn.execute(
-            "INSERT INTO people (customer_id, name, role, email) VALUES (?, ?, ?, ?)",
-            (customer_id, name, role, email)
-        )
-        conn.commit()
+        try:
+            cursor = conn.execute(
+                "INSERT INTO people (customer_id, name, role, email) VALUES (?, ?, ?, ?)",
+                (customer_id, name, role, email)
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            raise  # caller handles as 409
         row = conn.execute(
             "SELECT id, customer_id, name, role, email FROM people WHERE id=?",
             (cursor.lastrowid,)
@@ -407,28 +420,4 @@ def insert_brief_feedback(brief_log_id: int, customer_id: str,
         )
         conn.commit()
 
-
-def get_analytics(customer_id: str) -> dict:
-    _require_user_id(customer_id, "get_analytics")
-    with get_db_connection() as conn:
-        total_briefs = conn.execute(
-            "SELECT COUNT(*) as n FROM brief_logs WHERE customer_id=?", (customer_id,)
-        ).fetchone()["n"]
-
-        avg_faithfulness = conn.execute(
-            "SELECT AVG(faithfulness_score) as avg FROM brief_logs WHERE customer_id=?",
-            (customer_id,)
-        ).fetchone()["avg"] or 0.0
-
-        feedback = conn.execute(
-            """SELECT section, AVG(rating) as avg_rating, COUNT(*) as count
-               FROM brief_feedback WHERE customer_id=? GROUP BY section""",
-            (customer_id,)
-        ).fetchall()
-
-    return {
-        "total_briefs": total_briefs,
-        "avg_faithfulness": round(avg_faithfulness, 3),
-        "feedback_by_section": [dict(r) for r in feedback],
-    }
 

@@ -1,15 +1,15 @@
 import os
 import re
-import json as _json
+import json
 import logging
 import functools
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 _log = logging.getLogger(__name__)
 
-from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, UnstructuredHTMLLoader
+from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
@@ -115,9 +115,11 @@ class _LazyEmbedder(Embeddings):
 
 
 vectorstore = Chroma(collection_name="child_chunks", persist_directory=CHROMA_DIR,
-                     embedding_function=_LazyEmbedder())
+                     embedding_function=_LazyEmbedder(),
+                     collection_metadata={"hnsw:space": "cosine"})
 parent_store = Chroma(collection_name="parent_chunks", persist_directory=CHROMA_DIR,
-                      embedding_function=_LazyEmbedder())
+                      embedding_function=_LazyEmbedder(),
+                      collection_metadata={"hnsw:space": "cosine"})
 
 
 # ── Cross-encoder reranker ────────────────────────────────────────────────────
@@ -142,6 +144,24 @@ def rerank_docs(query: str, docs: List[Document], top_k: int = 4) -> List[Docume
     return [doc for _, doc in ranked[:top_k]]
 
 
+def _diversity_cap(docs: List[Document], max_per_source: int = 2) -> List[Document]:
+    """Cap chunks per source file so no single document dominates the answer.
+
+    Preserves rerank ordering — keeps the first max_per_source chunks per
+    filename and discards extras. Applied after reranking so priority is
+    maintained within each source.
+    """
+    seen: Dict[str, int] = {}
+    result = []
+    for doc in docs:
+        src = doc.metadata.get("filename") or doc.metadata.get("source") or ""
+        count = seen.get(src, 0)
+        if count < max_per_source:
+            seen[src] = count + 1
+            result.append(doc)
+    return result
+
+
 def warmup_models() -> None:
     """Force-load the embedding model, cross-encoder, and spaCy at API startup.
 
@@ -164,6 +184,10 @@ def warmup_models() -> None:
 
 # ── BM25 ──────────────────────────────────────────────────────────────────────
 def _tokenize(text): return re.findall(r"[a-z0-9]+", text.lower())
+
+# Cache: user_id → (doc_count, BM25Okapi_index, texts, metas)
+# Invalidated automatically when doc_count changes (upload / delete).
+_bm25_cache: Dict[str, Tuple[int, Any, List, List]] = {}
 
 
 def bm25_search(query, user_id, k=10):
@@ -190,7 +214,16 @@ def bm25_search(query, user_id, k=10):
     metas = result.get("metadatas") or []
     if not texts:
         return []
-    idx = BM25Okapi([_tokenize(t) for t in texts])
+
+    # Reuse a cached index when the corpus size hasn't changed.
+    # This avoids rebuilding an O(n) BM25 index from scratch on every query.
+    cached = _bm25_cache.get(user_id)
+    if cached is not None and cached[0] == len(texts):
+        idx, texts, metas = cached[1], cached[2], cached[3]
+    else:
+        idx = BM25Okapi([_tokenize(t) for t in texts])
+        _bm25_cache[user_id] = (len(texts), idx, texts, metas)
+
     scores = idx.get_scores(_tokenize(query))
     top_n = min(k, len(texts))
     top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_n]
@@ -297,7 +330,7 @@ class HybridRetriever(BaseRetriever):
     user_id: str = "default"
     k_dense: int = 10
     k_bm25: int = 10
-    k_rerank: int = 4
+    k_rerank: int = 6
 
     class Config:
         arbitrary_types_allowed = True
@@ -318,17 +351,18 @@ class HybridRetriever(BaseRetriever):
 
         if RETRIEVAL_MODE == "dense":
             # Dense only, top-k_rerank results
-            return self._maybe_boost(query, dense[:self.k_rerank])
+            return self._maybe_boost(query, _diversity_cap(dense[:self.k_rerank]))
 
         sparse = bm25_search(query, self.user_id, k=self.k_bm25)
         merged = rrf_merge(dense, sparse)
 
         if RETRIEVAL_MODE == "dense_bm25":
             # Dense + BM25 via RRF, no reranker, no parent fetch
-            return self._maybe_boost(query, merged[:self.k_rerank])
+            return self._maybe_boost(query, _diversity_cap(merged[:self.k_rerank]))
 
         # Full pipeline
         child_top = rerank_docs(query, merged, top_k=self.k_rerank)
+        child_top = _diversity_cap(child_top)
         parents = fetch_parents(child_top, self.user_id)
         return self._maybe_boost(query, parents)
 
@@ -385,6 +419,10 @@ def sentence_chunk(text, size=256, overlap=64):
         chunk_text = " ".join(group).strip()
         if chunk_text:
             chunks.append(Document(page_content=chunk_text))
+        # Break immediately when all sentences are consumed — continuing would
+        # produce tiny tail artifact chunks (same bug as transcript_chunker).
+        if j >= len(sentences):
+            break
         overlap_words = 0; step = j
         while step > i + 1 and overlap_words < overlap:
             step -= 1
@@ -414,11 +452,22 @@ def _split_sentences(text):
             try:
                 _nlp.enable_pipe("senter")
             except Exception:
-                pass  # senter already active or unavailable; use whatever loaded
+                pass  # senter may already be active in some model versions
+            # Verify that sentence segmentation is actually available.
+            # If neither senter nor parser is present, doc.sents yields the whole
+            # text as one sentence — silently producing one massive chunk per PDF.
+            if not _nlp.has_pipe("senter") and not _nlp.has_pipe("parser"):
+                _spacy_unavailable = True
+                _log.warning(
+                    "spacy_no_sentence_segmenter_using_regex_fallback "
+                    "(model has neither senter nor parser — "
+                    "run: python -m spacy download en_core_web_sm)"
+                )
         except Exception:
             _spacy_unavailable = True
             _log.warning("spacy_unavailable_using_regex_fallback "
                          "(install: python -m spacy download en_core_web_sm)")
+        if _spacy_unavailable:
             parts = re.split(r"(?<=[.!?])\s+", text)
             return [p.strip() for p in parts if p.strip()]
     try:
@@ -429,8 +478,30 @@ def _split_sentences(text):
         return [p.strip() for p in parts if p.strip()]
 
 
+_PDF_OCR_CHAR_THRESHOLD = 80   # pages with fewer chars after extraction get OCR'd
+
+
+def _ocr_page(page) -> str:
+    """Try to extract text from a fitz page via OCR. Returns '' if OCR not available."""
+    try:
+        import pytesseract
+        from PIL import Image
+        import io
+        pix = page.get_pixmap(dpi=200)
+        img = Image.open(io.BytesIO(pix.tobytes("png")))
+        return pytesseract.image_to_string(img, config="--psm 6")
+    except Exception:
+        return ""
+
+
 def _load_pdf_full(file_path):
-    """Full pipeline: pymupdf + noise + sentence chunk. Fallbacks kept."""
+    """Full pipeline: pymupdf + noise + sentence chunk. Fallbacks kept.
+
+    For pages where fitz extracts fewer than _PDF_OCR_CHAR_THRESHOLD characters
+    (common for dashboard screenshots or image-only slides), an OCR pass is
+    attempted via pytesseract if it is installed. Pages where neither fitz nor
+    OCR yields text are silently skipped.
+    """
     try:
         import fitz
         pages = []
@@ -438,7 +509,11 @@ def _load_pdf_full(file_path):
         with fitz.open(file_path) as pdf:
             for page in pdf:
                 text = page.get_text("text")
-                if text:
+                if len(text.strip()) < _PDF_OCR_CHAR_THRESHOLD:
+                    ocr_text = _ocr_page(page)
+                    if ocr_text.strip():
+                        text = ocr_text
+                if text.strip():
                     raw_pages.append(text)
                     pages.append(noise_filter(text))
         full_text = "\n\n".join(pages)
@@ -462,48 +537,75 @@ def _load_pdf_full(file_path):
     return docs
 
 
-def _load_pdf_baseline(file_path):
-    """Baseline: PyPDFLoader + RecursiveCharacterTextSplitter(800, 200). No noise filter."""
-    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=200)
-    return splitter.split_documents(PyPDFLoader(file_path).load())
-
-
 def _load_docx_full(file_path):
     try:
         import docx
+        from docx.oxml.ns import qn as _qn
+        from docx.text.paragraph import Paragraph as _DocxParagraph
+        from docx.table import Table as _DocxTable
+
         d = docx.Document(file_path)
         chunks_raw = []
-        current_heading = ""; current_paras = []
+        current_heading = ""
+        current_paras: list = []
+
         def flush():
             if current_paras:
                 text = (current_heading + "\n" + "\n".join(current_paras)).strip()
-                chunks_raw.append(Document(page_content=text,
-                    metadata={"source": file_path, "heading": current_heading}))
-        for para in d.paragraphs:
-            if para.style.name.startswith("Heading"):
-                flush()
-                current_heading = para.text.strip()
-                current_paras = []
-            elif para.text.strip():
-                current_paras.append(para.text.strip())
+                if text:
+                    chunks_raw.append(Document(
+                        page_content=text,
+                        metadata={"source": file_path, "heading": current_heading},
+                    ))
+
+        def _table_to_rows(tbl: "_DocxTable") -> list:
+            """Return non-empty rows as pipe-separated strings."""
+            rows = []
+            for row in tbl.rows:
+                cells = [cell.text.strip() for cell in row.cells]
+                # Deduplicate merged cells (python-docx repeats merged cell text)
+                seen = set()
+                unique = []
+                for c in cells:
+                    if c and c not in seen:
+                        seen.add(c)
+                        unique.append(c)
+                if unique:
+                    rows.append(" | ".join(unique))
+            return rows
+
+        # Walk body children in document order to maintain heading context for tables
+        for child in d.element.body:
+            local = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+            if local == "p":
+                para = _DocxParagraph(child, d)
+                if para.style.name.startswith("Heading"):
+                    flush()
+                    current_heading = para.text.strip()
+                    current_paras = []
+                elif para.text.strip():
+                    current_paras.append(para.text.strip())
+            elif local == "tbl":
+                table = _DocxTable(child, d)
+                rows = _table_to_rows(table)
+                if rows:
+                    # Emit table text as a labelled block under the current heading
+                    label = f"{current_heading} [table]" if current_heading else "[table]"
+                    current_paras.append(f"{label}\n" + "\n".join(rows))
+
         flush()
         if chunks_raw:
-            docs = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=200).split_documents(chunks_raw)
-            for d in docs:
-                d.metadata.setdefault("doc_type", "qbr_deck")
+            docs = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200).split_documents(chunks_raw)
+            for doc in docs:
+                doc.metadata.setdefault("doc_type", "qbr_deck")
             return docs
     except Exception:
         pass
-    docs = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=200).split_documents(
+    docs = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200).split_documents(
         Docx2txtLoader(file_path).load())
-    for d in docs:
-        d.metadata.setdefault("doc_type", "qbr_deck")
+    for doc in docs:
+        doc.metadata.setdefault("doc_type", "qbr_deck")
     return docs
-
-
-def _load_docx_baseline(file_path):
-    return RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=200).split_documents(
-        Docx2txtLoader(file_path).load())
 
 
 def _load_html_full(file_path):
@@ -516,26 +618,22 @@ def _load_html_full(file_path):
         docs = splitter.split_text(html)
         for d in docs:
             d.metadata.setdefault("source", file_path)
-        result = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=200).split_documents(docs)
+        result = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200).split_documents(docs)
         for d in result:
             d.metadata.setdefault("doc_type", "solution_architecture")
         return result
     except Exception:
-        result = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=200).split_documents(
-            UnstructuredHTMLLoader(file_path).load())
+        # BeautifulSoup fallback — avoids fetching external resources referenced
+        # in the HTML (scripts, stylesheets), which would be a potential SSRF vector.
+        from bs4 import BeautifulSoup
+        with open(file_path, "r", encoding="utf-8", errors="replace") as _f:
+            _html = _f.read()
+        _text = BeautifulSoup(_html, "html.parser").get_text(separator="\n")
+        _docs = [Document(page_content=_text, metadata={"source": file_path})]
+        result = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200).split_documents(_docs)
         for d in result:
             d.metadata.setdefault("doc_type", "solution_architecture")
         return result
-
-
-def _load_html_baseline(file_path):
-    # Read file directly to avoid UnstructuredHTMLLoader making external HTTP requests
-    from bs4 import BeautifulSoup
-    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-        html = f.read()
-    text = BeautifulSoup(html, "html.parser").get_text(separator="\n")
-    docs = [Document(page_content=text, metadata={"source": file_path})]
-    return RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=200).split_documents(docs)
 
 
 def _load_transcript(file_path):
@@ -549,14 +647,14 @@ def _load_transcript(file_path):
     from ingestion.transcript_parser import parse as parse_t
     from ingestion.transcript_chunker import chunk as chunk_t
     turns = parse_t(file_path)
-    # "Real" transcript signal: at least 2 distinct speakers OR multiple turns.
-    # The default-fallback turn (one turn, speaker="Speaker") fails both.
-    distinct_speakers = {t.speaker for t in turns}
-    if len(turns) <= 1 or distinct_speakers == {"Speaker"}:
+    # Fall back to plain-text only when the entire file parsed as a single turn
+    # (no speaker labels found at all). Multi-turn single-speaker transcripts
+    # (webinars, lectures) still go through chunk_t — _load_plain_text's
+    # noise_filter strips short dialogue lines (<4 words) which destroys content.
+    if len(turns) <= 1:
         _log.info("transcript_parser_no_speaker_labels_falling_back_to_plain_text",
                   extra={"file": os.path.basename(file_path),
-                         "turn_count": len(turns),
-                         "distinct_speakers": list(distinct_speakers)})
+                         "turn_count": len(turns)})
         return _load_plain_text(file_path)
     return chunk_t(turns, source=file_path)
 
@@ -567,12 +665,14 @@ def _load_ticket(file_path):
     from ingestion.ticket_chunker import chunk as chunk_t
     try:
         ticket = parse_t(file_path)
-        # Real ticket signal: has at least one of description / comments / resolution.
-        if not (ticket.description or ticket.comments or ticket.resolution):
-            raise ValueError("not ticket-shaped (no description/comments/resolution)")
+        # Real ticket signal: has subject OR at least one body field.
+        # Subject-only tickets (common in Zendesk exports) are valid — rejecting them
+        # caused fallback to _load_generic_json, losing all structured metadata.
+        if not (ticket.subject or ticket.description or ticket.comments or ticket.resolution):
+            raise ValueError("not ticket-shaped (no subject/description/comments/resolution)")
         return chunk_t(ticket, source=file_path)
     except Exception as e:
-        _log.info("ticket_parser_unrecognized_falling_back_to_generic_json",
+        _log.info("ticket_parser_unrecognized_falling_back_to_genericjson",
                   extra={"file": os.path.basename(file_path), "error": str(e)})
         return _load_generic_json(file_path)
 
@@ -602,39 +702,60 @@ def resolve_doc_date(filename: str, contents: bytes, doc_type: str) -> Optional[
     """Return a YYYY-MM-DD content date, or None if no date is recoverable.
 
     Priority (first hit wins):
-      1. Filename prefix: e.g. ``2025-03-28_meridian_call.txt``
-      2. Format-specific extraction:
-         - transcript / plain_text: regex over first 1KB
-         - ticket: ``created_at`` field in the JSON
+      1. Format-specific extraction (content is authoritative for structured types):
+         - transcript / plain_text / account_notes: regex over first 1 KB
+         - ticket / genericjson: ``created_at`` / ``updated_at`` fields
+         - commitment_tracker: latest of all target_date / completed_date values
+      2. Filename prefix: e.g. ``2025-03-28_meridian_call.txt``
+         (fallback only — user-supplied filenames are frequently inaccurate)
       3. None — caller falls back to upload timestamp
 
     Used at ingest time to stamp ``doc_date`` on every chunk's metadata so
     retrieval and the LLM can reason about recency.
     """
-    # 1. Filename prefix
-    m = _FILENAME_DATE_RE.match(filename or "")
-    if m:
-        return m.group(1)
-
-    # 2. Format-specific
-    if doc_type in ("transcript", "plain_text"):
+    # 1a. Text-based content extraction (transcript, account notes)
+    if doc_type in ("transcript", "plain_text", "account_notes"):
         try:
-            head = contents[:1024].decode("utf-8", errors="ignore")
+            head = contents[:2048].decode("utf-8", errors="ignore")
             m = _CONTENT_DATE_RE.search(head)
             if m:
                 return m.group(1)
         except Exception:
             pass
 
+    # 1b. Ticket / generic JSON — use the most recent timestamp field
     if doc_type in ("ticket", "generic_json"):
         try:
-            data = _json.loads(contents)
+            data = json.loads(contents)
             if isinstance(data, dict):
-                ts = data.get("created_at") or data.get("created") or data.get("date")
-                if isinstance(ts, str) and len(ts) >= 10 and _CONTENT_DATE_RE.match(ts[:10]):
-                    return ts[:10]
+                # Prefer updated_at over created_at — it's more recent
+                for field in ("updated_at", "created_at", "created", "date"):
+                    ts = data.get(field)
+                    if isinstance(ts, str) and len(ts) >= 10 and _CONTENT_DATE_RE.match(ts[:10]):
+                        return ts[:10]
         except Exception:
             pass
+
+    # 1c. Commitment tracker JSON — use latest date across all records
+    if doc_type == "commitment_tracker":
+        try:
+            data = json.loads(contents)
+            items = data if isinstance(data, list) else data.get("commitments", [])
+            dates = []
+            for item in items:
+                for field in ("current_target_date", "promised_date", "last_updated"):
+                    val = item.get(field, "")
+                    if isinstance(val, str) and _CONTENT_DATE_RE.match(val[:10] if len(val) >= 10 else ""):
+                        dates.append(val[:10])
+            if dates:
+                return max(dates)
+        except Exception:
+            pass
+
+    # 2. Filename prefix fallback (user-supplied, may be inaccurate)
+    m = _FILENAME_DATE_RE.match(filename or "")
+    if m:
+        return m.group(1)
 
     return None
 
@@ -658,7 +779,7 @@ def resolve_doc_metadata(filename: str, contents: bytes, doc_type: str) -> dict:
 
     if doc_type == "ticket":
         try:
-            data = _json.loads(contents)
+            data = json.loads(contents)
             if isinstance(data, dict):
                 for field in ("reporter", "assignee", "updated_at"):
                     val = data.get(field)
@@ -735,12 +856,16 @@ def _recency_boost(docs: List[Document], semantic_weight: float = 0.4) -> List[D
 
 
 def _walk_json_strings(obj, out=None):
-    """Recursively collect all string values from a nested JSON structure."""
+    """Recursively collect meaningful string values from a nested JSON structure.
+
+    Skips strings shorter than 10 chars — single-word enum values ("true", "1",
+    "open", "NA") add no retrievable signal and pollute chunk text.
+    """
     if out is None:
         out = []
     if isinstance(obj, str):
-        if obj.strip():
-            out.append(obj)
+        if len(obj.strip()) >= 10:
+            out.append(obj.strip())
     elif isinstance(obj, dict):
         for v in obj.values():
             _walk_json_strings(v, out)
@@ -753,11 +878,10 @@ def _walk_json_strings(obj, out=None):
 
 def _load_generic_json(file_path):
     """Load JSON that isn't ticket-shaped — concatenate string values, sentence-chunk."""
-    import json as _json
     with open(file_path, "r", encoding="utf-8", errors="replace") as f:
         try:
-            data = _json.load(f)
-        except _json.JSONDecodeError:
+            data = json.load(f)
+        except json.JSONDecodeError:
             # Fall back to treating it as plain text rather than raising
             return _load_plain_text(file_path)
     flat = _walk_json_strings(data)
@@ -769,9 +893,21 @@ def _load_generic_json(file_path):
     return chunks
 
 
+_CSV_TERMINAL_STATUSES = frozenset({
+    "closed", "resolved", "done", "complete", "completed",
+    "fixed", "won't fix", "wontfix", "duplicate", "cancelled", "canceled",
+    "rejected", "invalid",
+})
+
+
 def _load_csv_tickets(file_path):
-    """Load a CSV export of tickets (Jira/Zendesk) using ticket_csv_parser."""
+    """Load a CSV export of tickets (Jira/Zendesk) using ticket_csv_parser.
+
+    Each ticket is split by section (header, description, resolution) and long
+    sections are further split so the embedding model never receives truncated input.
+    """
     from ingestion.ticket_csv_parser import parse_csv
+    from ingestion.ticket_chunker import _split_long_text
     try:
         records = parse_csv(file_path)
     except Exception as e:
@@ -780,24 +916,42 @@ def _load_csv_tickets(file_path):
         return _load_plain_text(file_path)
     docs = []
     for rec in records:
-        text = f"Ticket: {rec.ticket_id}\nTitle: {rec.summary}\nStatus: {rec.status}\nPriority: {rec.priority}\n"
-        if rec.description:
-            text += f"Description: {rec.description}\n"
-        if rec.resolution:
-            text += f"Resolution: {rec.resolution}\n"
-        doc = Document(
-            page_content=text.strip(),
-            metadata={
-                "source": file_path,
-                "doc_type": "ticket",
-                "ticket_id": rec.ticket_id or "",
-                "status": rec.status or "",
-                "priority": rec.priority or "",
-                "created_date": rec.created_date or "",
-                "doc_date": rec.created_date or "",
-            }
+        base_meta = {
+            "source": file_path,
+            "doc_type": "ticket",
+            "ticket_id": rec.ticket_id or "",
+            "status": rec.status or "",
+            "priority": rec.priority or "",
+            "created_date": rec.created_date or "",
+            "doc_date": rec.created_date or "",
+            "is_open": str((rec.status or "").lower() not in _CSV_TERMINAL_STATUSES).lower(),
+        }
+        header = (
+            f"Ticket: {rec.ticket_id}\nTitle: {rec.summary}\n"
+            f"Status: {rec.status}\nPriority: {rec.priority}"
         )
-        docs.append(doc)
+        # Description — split if long
+        if rec.description:
+            for seg_i, seg in enumerate(_split_long_text(rec.description)):
+                meta = {**base_meta, "section": "description"}
+                if seg_i > 0:
+                    meta["section_part"] = seg_i
+                docs.append(Document(
+                    page_content=f"{header}\nDescription: {seg}",
+                    metadata=meta,
+                ))
+        else:
+            docs.append(Document(page_content=header, metadata={**base_meta, "section": "description"}))
+        # Resolution — split if long
+        if rec.resolution:
+            for seg_i, seg in enumerate(_split_long_text(rec.resolution)):
+                meta = {**base_meta, "section": "resolution"}
+                if seg_i > 0:
+                    meta["section_part"] = seg_i
+                docs.append(Document(
+                    page_content=f"Ticket: {rec.ticket_id} Title: {rec.summary}\nResolution: {seg}",
+                    metadata=meta,
+                ))
     if not docs:
         return _load_plain_text(file_path)
     return docs
@@ -812,9 +966,23 @@ def _load_csv_commitments(file_path):
         _log.warning("commitment_csv_parse_failed fallback_to_plain file=%s error=%s",
                      os.path.basename(file_path), str(e))
         return _load_plain_text(file_path)
+
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     docs = []
     for rec in records:
-        text = f"Commitment: {rec.description}\nStatus: {rec.status}\n"
+        target = rec.current_target_date or rec.promised_date or ""
+        is_overdue = bool(target and getattr(rec, "is_open", True) and target < today_str)
+        days_overdue = 0
+        if is_overdue:
+            try:
+                days_overdue = (
+                    datetime.strptime(today_str, "%Y-%m-%d") - datetime.strptime(target, "%Y-%m-%d")
+                ).days
+            except Exception:
+                pass
+
+        overdue_line = f"\nOVERDUE by {days_overdue} days (target was {target})" if is_overdue else ""
+        text = f"Commitment: {rec.description}{overdue_line}\nStatus: {rec.status}\n"
         if rec.promised_date:
             text += f"Promised: {rec.promised_date}\n"
         if rec.current_target_date:
@@ -832,9 +1000,12 @@ def _load_csv_commitments(file_path):
                 "current_target_date": rec.current_target_date or "",
                 "owner": rec.owner or "",
                 "is_slipped": str(getattr(rec, "is_slipped", False)).lower(),
-                "is_overdue": str(getattr(rec, "is_overdue", False)).lower(),
+                "is_overdue": str(is_overdue).lower(),
+                "days_overdue": days_overdue,
                 "customer_aware": str(getattr(rec, "customer_aware", False)).lower(),
-                "doc_date": rec.promised_date or "",
+                # doc_date: current_target_date reflects the commitment's most recent
+                # relevant date; falls back to promised_date if no target is set.
+                "doc_date": rec.current_target_date or rec.promised_date or "",
             }
         )
         docs.append(doc)
@@ -921,26 +1092,24 @@ _FULL_STRATEGY: Dict[str, IngestStrategy] = {
         # found — so a memo .txt still indexes (just without speaker metadata).
         loader=_load_transcript,
         use_parent_child_resplit=False,
-        natural_unit="multi-turn speaker group (~300 words, 2-turn overlap)",
+        natural_unit="per-speaker-turn segment (same-speaker runs merged ≤120 words, prior-turn context prepended)",
         rationale=(
-            "DECISION ANCHOR: this skip is justified by CITATION QUALITY, not "
-            "by embedding-cost considerations. Bisecting a speaker turn at 500 "
-            "chars produces fragments like 'Sarah: We agreed last week that "
-            "we'd ship pull' — incoherent in citations and mis-attributing the "
-            "tail to whichever speaker label happens to fall in the next "
-            "fragment. This is true regardless of which embedder is used. "
-            "Do NOT reverse this decision just because the embedder gets "
-            "faster — the bisection breakage is in the chunk boundaries, not "
-            "in the vectors. The transcript chunker already produces "
-            "right-sized chunks (~300 words) with 2-turn overlap so cross-turn "
-            "context survives. Citation passages read as full speaker turns. "
-            "If smaller embedded units are wanted later, see the 'Future "
-            "enhancement: turn-level sub-chunking' note in SystemDesign.md."
+            "DECISION ANCHOR: no character-boundary bisection of speaker turns. "
+            "Bisecting at 500 chars produces fragments like 'Sarah: We agreed we'd "
+            "ship' — incoherent in citations and mis-attributing tail text to the "
+            "wrong speaker. Per-speaker-segment chunks fix the speaker-semantic "
+            "dilution problem: one chunk = one speaker's utterance, so the embedding "
+            "captures a single person's meaning rather than a blend of all speakers "
+            "in a 200-word window. Short consecutive same-speaker turns are merged "
+            "(≤120 words) to avoid noisy one-line chunks. A leading [Prior: ...] "
+            "context line in each chunk gives the LLM enough surrounding context "
+            "for accurate attribution. use_parent_child_resplit=False: speaker-segment "
+            "chunks are already the right size and are their own natural context unit."
         ),
     ),
     ".json": IngestStrategy(
         name="ticket",
-        # _load_ticket falls back to generic_json for non-ticket-shaped JSON.
+        # _load_ticket falls back to genericjson for non-ticket-shaped JSON.
         loader=_load_ticket,
         use_parent_child_resplit=False,
         natural_unit="ticket section (description / single comment / resolution)",
@@ -1010,8 +1179,17 @@ def load_and_split_document(file_path):
 
 
 # ── Indexing: parent-child for "full", flat for "baseline" and "sentence" ────
-_PARENT_SPLITTER = RecursiveCharacterTextSplitter(chunk_size=1600, chunk_overlap=200)
-_CHILD_SPLITTER  = RecursiveCharacterTextSplitter(chunk_size=500,  chunk_overlap=50)
+# Parent-child sizing rationale:
+#   Child (800 chars ≈ 160 words ≈ 200 tokens): embedded unit — sits in the
+#     optimal dense-retrieval range for text-embedding-004 (100–250 tokens).
+#   Parent (2400 chars ≈ 480 words): LLM context unit — 3:1 ratio gives the
+#     model a full three-child window of surrounding text for synthesis questions.
+#     The previous 1600-char parent (2:1 ratio) added only one extra child-width
+#     of context, which was insufficient for multi-paragraph answers.
+#   Child overlap (150 chars ≈ 18.75%): sentences that span a chunk boundary
+#     appear in both adjacent children, preserving retrieval signal at the seam.
+_PARENT_SPLITTER = RecursiveCharacterTextSplitter(chunk_size=2400, chunk_overlap=200)
+_CHILD_SPLITTER  = RecursiveCharacterTextSplitter(chunk_size=800,  chunk_overlap=150)
 
 
 _CONTEXTUAL_RETRIEVAL = os.getenv("CONTEXTUAL_RETRIEVAL", "").lower() in ("1", "true", "yes")
@@ -1069,7 +1247,7 @@ def _contextualize_chunks(chunks, filename):
                 page_content=f"[Context: {context}]\n\n{chunk.page_content}",
                 metadata={
                     **chunk.metadata,
-                    "has_context_prefix": True,   # flag for _strip_context_prefix
+                    "has_context_prefix": True,
                     "context_text": context,      # kept for debugging/transparency
                 },
             ))
@@ -1133,8 +1311,8 @@ def index_document_to_chroma(file_path, file_id, user_id="default", filename=Non
     fname = filename or os.path.basename(file_path)
     _warn_if_mixed_contextual(user_id)
     try:
-        # commitment_tracker: bypass the extension-based dispatch (it would
-        # route .json to the ticket loader). Load directly via commitment modules.
+        # commitment_tracker / transcript: bypass the extension-based dispatch.
+        # .json would otherwise route to the ticket loader for both doc types.
         if doc_type == "commitment_tracker":
             ext = os.path.splitext(file_path)[1].lower()
             if ext == ".csv":
@@ -1143,7 +1321,14 @@ def index_document_to_chroma(file_path, file_id, user_id="default", filename=Non
                 from ingestion.commitment_parser import parse as _parse_commit
                 from ingestion.commitment_chunker import chunk as _chunk_commit
                 _commits = _parse_commit(file_path)
-                raw_docs = _chunk_commit(_commits, source=fname)
+                raw_docs = _chunk_commit(
+                    _commits, source=fname,
+                    today=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                )
+        elif doc_type == "transcript":
+            # Always use the transcript loader regardless of extension so that
+            # Otter.ai JSON exports (.json) are parsed as transcripts, not tickets.
+            raw_docs = _load_transcript(file_path)
         else:
             raw_docs = load_and_split_document(file_path)
     except Exception as e:
@@ -1368,26 +1553,34 @@ def get_chunks_since_date(customer_id: str, since_date: str,
 
     Used by recent_changes_node to implement "since last call" window.
     Excludes ticket doc_types by default (open items are handled separately).
+
+    Chroma's $gte operator on string doc_date inside a $and compound filter fails
+    silently — returns [] rather than raising. The date filter is applied in Python
+    after fetching all is_latest_version chunks for this customer.
     """
     try:
         filters: list = [
             {"user_id": {"$eq": customer_id}},
-            {"doc_date": {"$gte": since_date}},
             {"is_latest_version": {"$eq": 1}},
         ]
         if exclude_doc_types:
             for dt in exclude_doc_types:
                 filters.append({"doc_type": {"$ne": dt}})
-        where = {"$and": filters} if len(filters) > 1 else filters[0]
+        where = {"$and": filters}
         result = vectorstore._collection.get(
             where=where,
             include=["documents", "metadatas"],
         )
         docs_raw = result.get("documents") or []
         metas_raw = result.get("metadatas") or []
-        return [
+        all_docs = [
             Document(page_content=docs_raw[i], metadata=metas_raw[i] or {})
             for i in range(len(docs_raw))
+        ]
+        # YYYY-MM-DD strings sort lexicographically — safe for Python string comparison
+        return [
+            d for d in all_docs
+            if (d.metadata.get("doc_date") or "1970-01-01") >= since_date
         ]
     except Exception as e:
         _log.error("get_chunks_since_date_failed customer=%s since=%s error=%s",
@@ -1395,9 +1588,76 @@ def get_chunks_since_date(customer_id: str, since_date: str,
         return []
 
 
-def demote_old_versions_in_chroma(customer_id: str, doc_type: str, new_file_id: int) -> int:
+def get_recent_resolved_tickets(customer_id: str, since_date: str) -> List[Document]:
+    """Return closed/resolved ticket chunks whose updated_at falls on or after since_date.
+
+    Used by recent_changes_node to enumerate tickets that closed in the window
+    rather than relying on retrieval to discover them.
+    """
+    _terminal_list = ["closed", "resolved", "done", "complete", "completed", "fixed"]
+    try:
+        result = vectorstore._collection.get(
+            where={"$and": [
+                {"user_id": {"$eq": customer_id}},
+                {"doc_type": {"$eq": "ticket"}},
+                {"is_latest_version": {"$eq": 1}},
+                {"status": {"$in": _terminal_list}},
+            ]},
+            include=["documents", "metadatas"],
+        )
+        docs = [
+            Document(page_content=result["documents"][i], metadata=result["metadatas"][i] or {})
+            for i in range(len(result.get("documents") or []))
+        ]
+        return [
+            d for d in docs
+            if (d.metadata.get("updated_at") or d.metadata.get("doc_date") or "") >= since_date
+        ]
+    except Exception as e:
+        _log.error("get_recent_resolved_tickets_failed customer=%s error=%s", customer_id, str(e))
+        return []
+
+
+def get_recent_completed_commitments(customer_id: str, since_date: str) -> List[Document]:
+    """Return commitment chunks with a delivered status and doc_date on or after since_date.
+
+    Used by recent_changes_node to enumerate commitments completed in the window.
+    """
+    _delivered = {"delivered", "done", "complete", "completed", "closed", "resolved", "fixed"}
+    try:
+        result = vectorstore._collection.get(
+            where={"$and": [
+                {"user_id": {"$eq": customer_id}},
+                {"doc_type": {"$eq": "commitment_tracker"}},
+                {"is_latest_version": {"$eq": 1}},
+            ]},
+            include=["documents", "metadatas"],
+        )
+        docs = [
+            Document(page_content=result["documents"][i], metadata=result["metadatas"][i] or {})
+            for i in range(len(result.get("documents") or []))
+        ]
+        return [
+            d for d in docs
+            if (d.metadata.get("commitment_status") or d.metadata.get("status") or "").lower()
+               in _delivered
+            and (d.metadata.get("doc_date") or "") >= since_date
+        ]
+    except Exception as e:
+        _log.error("get_recent_completed_commitments_failed customer=%s error=%s", customer_id, str(e))
+        return []
+
+
+def demote_old_versions_in_chroma(
+    customer_id: str, doc_type: str, new_file_id: int, filename: str = ""
+) -> int:
     """Set is_latest_version=0 in Chroma for all chunks of this customer+doc_type
     that belong to a prior upload (file_id != new_file_id).
+
+    When filename is provided the demotion is scoped to that filename only.
+    This is critical for doc types where multiple independent files coexist
+    (e.g. one JSON file per ticket) — without filename scoping, uploading
+    TICK-M002 would demote TICK-M001 to is_latest_version=0.
 
     Called immediately after set_latest_version_flag() so both SQLite and Chroma
     agree on which version is current. Returns the number of chunks demoted.
@@ -1405,15 +1665,16 @@ def demote_old_versions_in_chroma(customer_id: str, doc_type: str, new_file_id: 
     demoted = 0
     for store in (vectorstore, parent_store):
         try:
+            where_clauses: list = [
+                {"user_id": {"$eq": customer_id}},
+                {"doc_type": {"$eq": doc_type}},
+                {"is_latest_version": {"$eq": 1}},
+                {"file_id": {"$ne": new_file_id}},
+            ]
+            if filename:
+                where_clauses.append({"filename": {"$eq": filename}})
             result = store._collection.get(
-                where={
-                    "$and": [
-                        {"user_id": {"$eq": customer_id}},
-                        {"doc_type": {"$eq": doc_type}},
-                        {"is_latest_version": {"$eq": 1}},
-                        {"file_id": {"$ne": new_file_id}},
-                    ]
-                },
+                where={"$and": where_clauses},
                 include=["metadatas"],
             )
             ids = result.get("ids") or []
@@ -1431,3 +1692,175 @@ def demote_old_versions_in_chroma(customer_id: str, doc_type: str, new_file_id: 
         _log.info("demoted_old_versions customer=%s doc_type=%s count=%d",
                   customer_id, doc_type, demoted)
     return demoted
+
+
+def get_account_health_metrics(customer_id: str) -> dict:
+    """Compute account health KPIs from chunk metadata. Zero LLM calls.
+
+    Aggregates open ticket counts by priority and commitment slip/overdue
+    rates from the metadata stamped at ingest time (is_open, is_slipped,
+    target_date, priority). Returns raw counts plus a 0-100 health score.
+    """
+    from datetime import date
+    today = date.today().isoformat()
+
+    # ── Tickets ──────────────────────────────────────────────────────────────
+    ticket_chunks = get_latest_chunks_by_doctype(customer_id, "ticket")
+    open_p0 = 0
+    open_p1 = 0
+    seen_tickets: set = set()
+    for doc in ticket_chunks:
+        meta = doc.metadata
+        ticket_key = meta.get("ticket_id") or meta.get("file_id") or doc.page_content[:60]
+        if ticket_key in seen_tickets:
+            continue
+        seen_tickets.add(ticket_key)
+        is_open = meta.get("is_open") in ("true", True, "1")
+        if not is_open:
+            continue
+        priority = (meta.get("priority") or "").lower().replace("-", "").replace(" ", "")
+        if priority in ("p0", "critical", "urgent", "blocker"):
+            open_p0 += 1
+        elif priority in ("p1", "high"):
+            open_p1 += 1
+
+    # ── Commitments ──────────────────────────────────────────────────────────
+    commit_chunks = get_latest_chunks_by_doctype(customer_id, "commitment_tracker")
+    total_commitments = 0
+    open_commitments = 0
+    overdue_commitments = 0
+    slipped_commitments = 0
+    for doc in commit_chunks:
+        meta = doc.metadata
+        total_commitments += 1
+        if meta.get("is_slipped") in ("true", True, "1"):
+            slipped_commitments += 1
+        is_open = meta.get("is_open") in ("true", True, "1")
+        if is_open:
+            open_commitments += 1
+            if (meta.get("is_overdue") or "").lower() == "true":
+                overdue_commitments += 1
+            else:
+                # fallback for chunks ingested before is_overdue was stamped
+                target = (meta.get("current_target_date") or meta.get("target_date") or "").strip()
+                if target and target < today:
+                    overdue_commitments += 1
+
+    slip_rate = slipped_commitments / total_commitments if total_commitments > 0 else 0.0
+
+    # ── Score ─────────────────────────────────────────────────────────────────
+    # Each open P0 is the most severe signal — a single P0 alone should push
+    # an account into "At Risk". P1s are significant but not catastrophic.
+    # Overdue commitments are weighted heavily; slip rate less so (a commitment
+    # can slip without being overdue yet).
+    score = 100
+    score -= open_p0 * 25
+    score -= open_p1 * 8
+    score -= overdue_commitments * 12
+    score -= round(slip_rate * 20)
+    score = max(0, score)
+
+    if score >= 75:
+        band = "Healthy"
+    elif score >= 45:
+        band = "At Risk"
+    else:
+        band = "Critical"
+
+    return {
+        "open_p0_count": open_p0,
+        "open_p1_count": open_p1,
+        "overdue_commitment_count": overdue_commitments,
+        "total_open_commitments": open_commitments,
+        "slipped_commitment_count": slipped_commitments,
+        "total_commitments": total_commitments,
+        "commitment_slip_rate": round(slip_rate, 2),
+        "health_score": score,
+        "health_band": band,
+    }
+
+
+def get_person_relevant_chunks(
+    customer_id: str,
+    doc_types: List[str],
+    since_date: str = "",
+    max_results: int = 80,
+) -> List[Document]:
+    """Fetch narrative chunks for a customer filtered by doc_type at the Chroma layer.
+
+    Chroma's $gte operator on string doc_date inside a $and compound filter fails
+    silently (returns [] instead of raising). The date filter is therefore applied
+    in Python after the Chroma fetch — same pattern as get_chunks_since_date().
+
+    The doc_type $in filter IS applied at the Chroma layer, bounding the result set
+    to narrative doc types (transcript, account_notes, qbr_deck) before Python sees it.
+    Returns docs sorted by doc_date descending, capped at max_results.
+    """
+    try:
+        result = vectorstore._collection.get(
+            where={"$and": [
+                {"user_id": {"$eq": customer_id}},
+                {"doc_type": {"$in": doc_types}},
+                {"is_latest_version": {"$eq": 1}},
+            ]},
+            include=["documents", "metadatas"],
+        )
+        docs = [
+            Document(page_content=result["documents"][i], metadata=result["metadatas"][i] or {})
+            for i in range(len(result.get("documents") or []))
+        ]
+        # Apply date filter in Python — Chroma $gte on string fields fails silently
+        if since_date:
+            docs = [d for d in docs if (d.metadata.get("doc_date") or "1970-01-01") >= since_date]
+        docs.sort(key=lambda d: d.metadata.get("doc_date") or "1970-01-01", reverse=True)
+        return docs[:max_results]
+    except Exception as e:
+        _log.warning(
+            "get_person_relevant_chunks_failed customer=%s error=%s",
+            customer_id, str(e),
+        )
+        return []
+
+
+def structured_metadata_retrieve(
+    customer_id: str,
+    doc_type: str,
+    extra_filters: Optional[List[dict]] = None,
+    max_results: int = 30,
+) -> List[Document]:
+    """Retrieve chunks by metadata filters without semantic search.
+
+    Runs entirely at the ChromaDB layer — no embeddings, no reranking.
+    Used by retrieve_node for structured queries about commitments or tickets
+    where semantic ranking would miss records that don't score well against
+    the query string but match precisely on metadata predicates (status,
+    priority, date ranges, is_overdue, etc.).
+
+    extra_filters: list of Chroma where-clause dicts ANDed with the base
+    customer + doc_type + is_latest_version filter.
+    Returns up to max_results Documents sorted by doc_date descending.
+    """
+    try:
+        where_clauses: list = [
+            {"user_id": {"$eq": customer_id}},
+            {"doc_type": {"$eq": doc_type}},
+            {"is_latest_version": {"$eq": 1}},
+        ]
+        if extra_filters:
+            where_clauses.extend(extra_filters)
+        result = vectorstore._collection.get(
+            where={"$and": where_clauses},
+            include=["documents", "metadatas"],
+        )
+        docs = [
+            Document(page_content=result["documents"][i], metadata=result["metadatas"][i] or {})
+            for i in range(len(result.get("documents") or []))
+        ]
+        docs.sort(key=lambda d: d.metadata.get("doc_date") or "1970-01-01", reverse=True)
+        return docs[:max_results]
+    except Exception as e:
+        _log.warning(
+            "structured_metadata_retrieve_failed customer=%s doc_type=%s error=%s",
+            customer_id, doc_type, str(e),
+        )
+        return []

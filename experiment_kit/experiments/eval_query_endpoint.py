@@ -1,5 +1,5 @@
 """
-exp10_lookup.py — evaluate the /query endpoint for answer quality,
+eval_query_endpoint.py — evaluate the /query endpoint for answer quality,
 answer_status distribution, and latency.
 
 /query is the single-pass Q&A endpoint:
@@ -13,7 +13,7 @@ This experiment answers:
   - What is the p50/p95 latency?
 
 Usage:
-    python experiment_kit/experiments/exp10_lookup.py
+    python experiment_kit/experiments/eval_query_endpoint.py
 
 Requires: GOOGLE_API_KEY, API_KEY, EVAL_WORKSPACE, EVAL_PASSKEY set in env.
           API running on localhost:8000 (or override with QUERY_URL env var).

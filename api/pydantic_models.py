@@ -68,7 +68,7 @@ class AnticipatedQuestion(BaseModel):
     @classmethod
     def validate_urgency(cls, v):
         if v not in ("high", "medium", "low"):
-            return "medium"
+            raise ValueError(f"urgency must be high/medium/low, got {v!r}")
         return v
 
 
@@ -208,6 +208,20 @@ class CorpusHealth(BaseModel):
     missing_doc_types: List[str] = Field(default_factory=list)
 
 
+class AccountHealth(BaseModel):
+    health_score: int                        # 0–100
+    health_band: str                         # "Healthy" | "At Risk" | "Critical"
+    open_p0_count: int = 0
+    open_p1_count: int = 0
+    overdue_commitment_count: int = 0
+    total_open_commitments: int = 0
+    slipped_commitment_count: int = 0
+    total_commitments: int = 0
+    commitment_slip_rate: float = 0.0        # 0.0–1.0
+    days_since_last_call: Optional[int] = None
+    missing_doc_types: List[str] = Field(default_factory=list)
+
+
 class PersonCreate(BaseModel):
     name: str
     role: Optional[str] = None
@@ -231,7 +245,7 @@ class BriefFeedback(BaseModel):
         return v
 
 
-# ── Legacy document management (kept for /upload-doc and /delete-doc compat) ──
+# ── Document management ───────────────────────────────────────────────────────
 
 class DocumentInfo(BaseModel):
     id: int
@@ -240,5 +254,3 @@ class DocumentInfo(BaseModel):
     user_id: str
 
 
-class DeleteFileRequest(BaseModel):
-    file_id: int

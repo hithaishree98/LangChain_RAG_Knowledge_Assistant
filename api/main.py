@@ -6,7 +6,7 @@ import os
 import secrets
 import tempfile
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile, Depends, status
@@ -18,15 +18,15 @@ from pydantic_models import (
     PreMeetingBriefRequest, PreMeetingBrief,
     ExecBriefRequest, ExecBrief,
     QueryRequest, QueryResult,
-    CustomerCreate, CustomerResponse, CorpusHealth,
+    CustomerCreate, CustomerResponse, CorpusHealth, AccountHealth,
     PersonCreate, BriefFeedback,
     TokenRequest,
-    DocumentInfo, DeleteFileRequest,
+    DocumentInfo,
 )
 from langchain_utils import llm_breaker
-from chroma_utils import index_document_to_chroma, delete_doc_from_chroma, vectorstore
+from chroma_utils import index_document_to_chroma, delete_doc_from_chroma, vectorstore, get_account_health_metrics, get_latest_chunks_by_doctype
 from db_utils import (
-    get_all_documents,
+    get_all_documents, document_exists,
     insert_document_record, delete_document_record,
     get_query_stats, get_audit_log, run_migrations, insert_brief_log,
     set_latest_version_flag,
@@ -38,6 +38,7 @@ from db_utils import (
 
 from utils.doc_type_utils import (
     VALID_DOC_TYPES, infer_doc_type, validate_filename, extract_date_from_filename,
+    check_content_descriptor_consistency, sniff_doc_type,
 )
 
 
@@ -77,6 +78,9 @@ class StructuredLogger:
 
 
 log = StructuredLogger("rag_api")
+
+# Holds references to background notification tasks so they aren't GC'd mid-flight.
+_background_tasks: set = set()
 
 
 _ENV = os.getenv("ENVIRONMENT", "development").lower()
@@ -369,6 +373,45 @@ async def get_corpus_health_endpoint(customer_id: str, user_id: str = Depends(ge
     return CorpusHealth(**health)
 
 
+@app.get("/customers/{customer_id}/health-score", response_model=AccountHealth,
+         dependencies=[Depends(verify_api_key)])
+async def get_health_score_endpoint(customer_id: str, user_id: str = Depends(get_current_user)):
+    """Return computed account health KPIs. No LLM calls — pure metadata aggregation."""
+    if get_customer_by_slug(customer_id, user_id) is None:
+        raise HTTPException(status_code=404, detail=f"Customer '{customer_id}' not found.")
+    try:
+        metrics = get_account_health_metrics(customer_id)
+        corpus = get_corpus_health(customer_id)
+
+        days_since_call: int | None = None
+        last_call = corpus.get("last_call_date")
+        if last_call:
+            try:
+                delta = (date.today() - date.fromisoformat(last_call)).days
+                days_since_call = delta
+                # Penalise the health score for stale contact (>14 days)
+                if delta > 14:
+                    penalty = min(20, (delta - 14) * 2)
+                    metrics["health_score"] = max(0, metrics["health_score"] - penalty)
+                    if metrics["health_score"] >= 75:
+                        metrics["health_band"] = "Healthy"
+                    elif metrics["health_score"] >= 45:
+                        metrics["health_band"] = "At Risk"
+                    else:
+                        metrics["health_band"] = "Critical"
+            except ValueError:
+                pass
+
+        return AccountHealth(
+            **metrics,
+            days_since_last_call=days_since_call,
+            missing_doc_types=corpus.get("missing_doc_types", []),
+        )
+    except Exception as e:
+        log.error("health_score_failed", customer_id=customer_id, error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to compute health score.")
+
+
 @app.post("/customers/{customer_id}/people", dependencies=[Depends(verify_api_key)])
 async def add_person_endpoint(
     customer_id: str,
@@ -384,6 +427,12 @@ async def add_person_endpoint(
     try:
         person = add_person(customer_numeric_id, req.name, req.role, req.email)
     except Exception as e:
+        import sqlite3
+        if isinstance(e, sqlite3.IntegrityError):
+            raise HTTPException(
+                status_code=409,
+                detail=f"A person named '{req.name}' already exists for this customer.",
+            )
         log.error("add_person_failed", customer_id=customer_id, error=str(e))
         raise HTTPException(status_code=500, detail="Failed to add person.")
     return person
@@ -443,7 +492,13 @@ async def upload_document(
             detail=f"File too large ({size_mb:.1f}MB). Maximum is {MAX_FILE_SIZE_MB}MB.")
 
     # 3. Resolve doc_type
+    # Priority: (1) caller-supplied explicit value, (2) filename keyword, (3) content sniff.
+    # Files no longer need to follow the date-prefix naming convention — users can upload
+    # files with any name and the system will detect the type automatically.
     filename = os.path.basename(file.filename)
+    sniff_detected: str | None = None
+    sniff_confidence: str = "low"
+
     if doc_type:
         try:
             from utils.doc_type_utils import normalize_doc_type
@@ -452,19 +507,41 @@ async def upload_document(
             raise HTTPException(status_code=400,
                 detail=f"doc_type must be one of: {sorted(VALID_DOC_TYPES)}")
     else:
+        # Try filename keyword first (fast, no I/O)
         doc_type = infer_doc_type(filename)
+        if doc_type is None:
+            # Fall back to content sniffing
+            sniff_detected, sniff_confidence = sniff_doc_type(contents, filename)
+            doc_type = sniff_detected
         if doc_type is None:
             raise HTTPException(status_code=400,
                 detail=(
-                    f"Cannot infer doc_type from filename '{filename}'. "
-                    f"For .json/.csv files, provide doc_type explicitly: "
-                    f"'ticket' or 'commitment_tracker'."
+                    f"Cannot determine document type for '{filename}'. "
+                    f"Please select a type from the dropdown: "
+                    f"{sorted(VALID_DOC_TYPES)}"
                 ))
 
-    # 4. Validate filename convention
+    # 4. Filename convention check — advisory only, does not block uploads.
+    # Users can upload any filename; the convention is encouraged but not required.
+    upload_warnings: list = []
     valid, err_msg = validate_filename(filename)
     if not valid:
-        raise HTTPException(status_code=400, detail=err_msg)
+        upload_warnings.append(
+            f"Tip: renaming files as YYYY-MM-DD_<type>_<descriptor>.ext improves "
+            f"automatic date detection (e.g. 2024-09-15_transcript_status-call.txt)."
+        )
+
+    # 4b. Lightweight content/descriptor consistency check (warning, does not block)
+    if doc_type in ("transcript", "commitment_tracker", "ticket"):
+        try:
+            content_sample = contents[:4096].decode("utf-8", errors="ignore")
+            consistency_warnings = check_content_descriptor_consistency(filename, doc_type, content_sample)
+            upload_warnings.extend(consistency_warnings)
+            for w in consistency_warnings:
+                log.warning("upload_content_filename_mismatch", filename=filename,
+                            customer_id=customer_id, detail=w)
+        except Exception:
+            pass
 
     # 5. Duplicate filename check
     replace_existing = replace.lower() in ("true", "1", "yes")
@@ -523,7 +600,7 @@ async def upload_document(
         set_latest_version_flag(customer_id, doc_type, file_id)
         try:
             from chroma_utils import demote_old_versions_in_chroma
-            demote_old_versions_in_chroma(customer_id, doc_type, file_id)
+            demote_old_versions_in_chroma(customer_id, doc_type, file_id, filename=filename)
         except Exception as e:
             log.warning("chroma_demotion_failed", customer_id=customer_id,
                         doc_type=doc_type, file_id=file_id, error=str(e))
@@ -547,15 +624,20 @@ async def upload_document(
                 except Exception as exc:
                     log.warning("transcript_notify_failed", customer_id=customer_id,
                                 filename=filename, error=str(exc))
-            asyncio.create_task(_notify())
+            task = asyncio.create_task(_notify())
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
 
-        return {
+        response: dict = {
             "file_id": file_id,
             "filename": filename,
             "doc_type": doc_type,
             "doc_date": doc_date,
             "chunks": index_summary.get("child_chunks", 0),
         }
+        if upload_warnings:
+            response["warnings"] = upload_warnings
+        return response
 
     except HTTPException:
         raise
@@ -593,8 +675,7 @@ def delete_customer_document(
     """Delete a document from a specific customer workspace."""
     if get_customer_by_slug(customer_id, user_id) is None:
         raise HTTPException(status_code=404, detail=f"Customer '{customer_id}' not found.")
-    existing = get_all_documents(user_id=customer_id)
-    if not any(doc["id"] == file_id for doc in existing):
+    if not document_exists(file_id, user_id=customer_id):
         raise HTTPException(status_code=404, detail="Document not found in this customer workspace.")
     chroma_ok = delete_doc_from_chroma(file_id, user_id=customer_id)
     db_ok = delete_document_record(file_id, user_id=customer_id)
@@ -672,6 +753,15 @@ async def pre_meeting_brief(
         insert_brief_log(req.customer_id, "pre_meeting", json.dumps(brief_dict))
     except Exception as e:
         log.error("brief_log_failed", customer_id=req.customer_id, error=str(e))
+
+    # Sync last_call_date from most recent transcript to DB so health score can compute days-since-call
+    try:
+        t_chunks = get_latest_chunks_by_doctype(req.customer_id, "transcript")
+        dates = [c.metadata.get("doc_date", "") for c in t_chunks if c.metadata.get("doc_date")]
+        if dates:
+            update_last_call_date(customer["id"], max(dates))
+    except Exception as e:
+        log.warning("last_call_date_sync_failed", customer_id=req.customer_id, error=str(e))
 
     # Cache the result
     try:
@@ -817,24 +907,6 @@ async def brief_feedback(req: BriefFeedback, user_id: str = Depends(get_current_
     return {"status": "recorded"}
 
 
-# ── Deprecated endpoints → 410 Gone ──────────────────────────────────────────
-
-@app.post("/brief")
-async def brief_deprecated():
-    raise HTTPException(status_code=410,
-        detail="Use POST /brief/pre-meeting or POST /brief/exec-1on1")
-
-
-@app.post("/lookup")
-async def lookup_deprecated():
-    raise HTTPException(status_code=410, detail="Use POST /query")
-
-
-@app.post("/chat")
-async def chat_deprecated():
-    raise HTTPException(status_code=410, detail="Use POST /query")
-
-
 # ── Documents: list / delete ──────────────────────────────────────────────────
 
 @app.get("/documents", response_model=List[DocumentInfo], dependencies=[Depends(verify_api_key)])
@@ -850,8 +922,7 @@ def list_documents(user_id: str = Depends(get_current_user)):
 @app.delete("/documents/{file_id}", dependencies=[Depends(verify_api_key)])
 def delete_document(file_id: int, user_id: str = Depends(get_current_user)):
     """Delete a document and its Chroma vectors from the workspace."""
-    existing = get_all_documents(user_id=user_id)
-    if not any(doc["id"] == file_id for doc in existing):
+    if not document_exists(file_id, user_id=user_id):
         raise HTTPException(status_code=404, detail="Document not found in your workspace.")
 
     chroma_ok = delete_doc_from_chroma(file_id, user_id=user_id)
@@ -888,27 +959,6 @@ def audit_log(limit: int = 100, user_id: str = Depends(get_current_user)):
     except Exception as e:
         log.error("audit_log_error", error=str(e), user_id=user_id)
         raise HTTPException(status_code=500, detail="Failed to load audit log.")
-
-
-@app.post("/upload-doc")
-async def upload_doc_deprecated():
-    raise HTTPException(status_code=410,
-        detail="Use POST /customers/{customer_id}/upload")
-
-
-@app.get("/list-docs")
-async def list_docs_deprecated():
-    raise HTTPException(status_code=410, detail="Use GET /documents")
-
-
-@app.post("/delete-doc")
-async def delete_doc_deprecated():
-    raise HTTPException(status_code=410, detail="Use DELETE /documents/{file_id}")
-
-
-@app.get("/analytics")
-async def analytics_deprecated():
-    raise HTTPException(status_code=410, detail="Use GET /stats")
 
 
 # ── Logs ──────────────────────────────────────────────────────────────────────
@@ -977,11 +1027,3 @@ def get_logs(level: str = None,
     return {"logs": parsed, "total": len(parsed)}
 
 
-@app.post("/answer-questionnaire")
-async def answer_questionnaire_deprecated():
-    raise HTTPException(status_code=410, detail="Use POST /query with individual questions instead.")
-
-
-@app.post("/chat/stream")
-async def chat_stream_deprecated():
-    raise HTTPException(status_code=410, detail="Use POST /query instead.")

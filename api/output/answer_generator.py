@@ -10,6 +10,7 @@ Uses 3-layer hallucination check (regex → classify → llm_judge) and maps the
 result to a confidence_explanation string the FDE can read directly.
 """
 
+import logging
 import os
 import re as _re
 from typing import Any, Dict, List, Optional
@@ -22,6 +23,8 @@ from langchain_utils import (
 )
 from utils.staleness import recency_flag as _recency_flag
 
+_log = logging.getLogger(__name__)
+
 # Doc types that are relevant to common query intents — used to populate
 # missing_doc_types when a query's answer isn't found in the corpus.
 _QUERY_DOC_TYPE_HINTS: List[tuple] = [
@@ -33,30 +36,40 @@ _QUERY_DOC_TYPE_HINTS: List[tuple] = [
 ]
 
 
-def _infer_missing_doc_types(query: str, retrieved_docs: list) -> List[str]:
-    """Return doc types likely needed to answer this query but not present in corpus."""
+def _infer_missing_doc_types(query: str, retrieved_docs: list, customer_id: str = "") -> List[str]:
+    """Return doc types likely needed to answer this query but not in the indexed corpus.
+
+    Queries the actual indexed corpus for this customer (via vectorstore) rather than
+    checking only the current retrieval result — a doc type that was uploaded but not
+    retrieved for this query should not be flagged as missing.
+    """
     query_lower = query.lower()
-    present_types = {d.metadata.get("doc_type", "") for d in retrieved_docs}
+
+    corpus_types: set = set()
+    if customer_id:
+        try:
+            from chroma_utils import vectorstore
+            result = vectorstore._collection.get(
+                where={"$and": [
+                    {"user_id": {"$eq": customer_id}},
+                    {"is_latest_version": {"$eq": 1}},
+                ]},
+                include=["metadatas"],
+            )
+            corpus_types = {
+                (m.get("doc_type") or "") for m in (result.get("metadatas") or [])
+            }
+        except Exception:
+            corpus_types = {d.metadata.get("doc_type", "") for d in retrieved_docs}
+    else:
+        corpus_types = {d.metadata.get("doc_type", "") for d in retrieved_docs}
+
     missing = []
     for keywords, doc_type in _QUERY_DOC_TYPE_HINTS:
-        if any(kw in query_lower for kw in keywords) and doc_type not in present_types:
+        if any(kw in query_lower for kw in keywords) and doc_type not in corpus_types:
             if doc_type not in missing:
                 missing.append(doc_type)
-    return missing[:3]  # cap to avoid overwhelming the UI
-
-
-def _strip_context_prefix(content: str, metadata: Dict[str, Any]) -> str:
-    """Remove the '[Context: ...]\\n\\n' prefix added by contextual retrieval."""
-    if not metadata.get("has_context_prefix"):
-        return content
-    if not content.startswith("[Context:"):
-        return content
-    close_bracket = content.find("]", len("[Context:"))
-    if close_bracket == -1:
-        return content
-    if content[close_bracket:close_bracket + 3] != "]\n\n":
-        return content
-    return content[close_bracket + 3:]
+    return missing[:3]
 
 
 def _build_citation(doc: Any) -> Optional[Dict[str, Any]]:
@@ -82,9 +95,24 @@ def _build_citation(doc: Any) -> Optional[Dict[str, Any]]:
 def _build_all_citations(
     ao: Dict[str, Any], chunk_map: Dict[str, Any]
 ) -> List[Dict[str, Any]]:
-    """Build one citation per unique source document that contributed to the answer."""
+    """Build one citation per unique source document that contributed to the answer.
+
+    Only citations whose chunk_id exists in chunk_map (the actual retrieved set) are
+    included. LLM-fabricated chunk_ids that don't match any retrieved chunk are logged
+    and silently dropped so forged citations never reach the user.
+    """
     seen_files: set = set()
     citations: List[Dict[str, Any]] = []
+
+    # Detect and log forged chunk IDs (present in LLM output but not retrieved)
+    raw_cids = [
+        c.get("chunk_id") for c in (ao.get("citations") or [])
+        if isinstance(c, dict) and c.get("chunk_id")
+    ]
+    forged = [cid for cid in raw_cids if cid not in chunk_map]
+    if forged:
+        _log.warning("citation_validation_forged_ids count=%d ids=%s",
+                     len(forged), str(forged[:5]))
 
     # Walk citations in answer_output order so the primary source comes first
     for citation_ref in (ao.get("citations") or []):
@@ -137,6 +165,9 @@ def generate_answer(state: Dict[str, Any]) -> Dict[str, Any]:
     parent_chunks = state.get("parent_chunks") or []
     child_chunks = state.get("retrieved_chunks") or []
     query = state.get("original_query", "")
+    customer_id = state.get("customer_id", "")
+    # reference_date: the calendar date this answer is computed FOR (today)
+    reference_date: Optional[str] = state.get("today_date") or state.get("as_of_date") or None
 
     # ── Short-circuit on system failures ─────────────────────────────────────
     if ao.get("_parse_error") or ao.get("_breaker_open"):
@@ -146,6 +177,8 @@ def generate_answer(state: Dict[str, Any]) -> Dict[str, Any]:
             "citation": None,
             "citations": [],
             "answer_as_of": None,
+            "reference_date": reference_date,
+            "latest_source_date": None,
             "confidence_explanation": "AI service temporarily unavailable — try again shortly.",
             "sources_searched": len(parent_chunks) or len(child_chunks),
             "recency_flag": None,
@@ -155,7 +188,7 @@ def generate_answer(state: Dict[str, Any]) -> Dict[str, Any]:
 
     # ── Hard not_found: no docs retrieved at all ──────────────────────────────
     if not parent_chunks and not child_chunks:
-        missing = _infer_missing_doc_types(query, [])
+        missing = _infer_missing_doc_types(query, [], customer_id=customer_id)
         explanation = "No documents were found for this customer."
         if missing:
             explanation += f" Upload a {missing[0]} to answer this type of question."
@@ -165,6 +198,8 @@ def generate_answer(state: Dict[str, Any]) -> Dict[str, Any]:
             "citation": None,
             "citations": [],
             "answer_as_of": None,
+            "reference_date": reference_date,
+            "latest_source_date": None,
             "confidence_explanation": explanation,
             "sources_searched": 0,
             "recency_flag": None,
@@ -189,7 +224,7 @@ def generate_answer(state: Dict[str, Any]) -> Dict[str, Any]:
 
     # ── Hard not_found from LLM ───────────────────────────────────────────────
     if answer_status == "not_found" or not answer_text.strip():
-        missing = _infer_missing_doc_types(query, all_docs)
+        missing = _infer_missing_doc_types(query, all_docs, customer_id=customer_id)
         explanation = "The uploaded documents don't contain a clear answer to this question."
         if missing:
             explanation += f" Consider uploading a {missing[0]}."
@@ -199,6 +234,8 @@ def generate_answer(state: Dict[str, Any]) -> Dict[str, Any]:
             "citation": None,
             "citations": [],
             "answer_as_of": None,
+            "reference_date": reference_date,
+            "latest_source_date": None,
             "confidence_explanation": explanation,
             "sources_searched": len(all_docs),
             "recency_flag": None,
@@ -210,11 +247,14 @@ def generate_answer(state: Dict[str, Any]) -> Dict[str, Any]:
     all_citations = _build_all_citations(ao, chunk_map)
     primary_citation = all_citations[0] if all_citations else None
 
-    # ── answer_as_of: most recent doc_date across all citations ──────────────
+    # ── Date handling: split reference date (today) from source date ─────────
+    # latest_source_date: max doc_date across all cited sources (WHEN the content is from)
+    # reference_date:     today (WHEN the answer is computed for) — set earlier from state
     citation_dates = [c["doc_date"] for c in all_citations if c.get("doc_date")]
-    answer_as_of: Optional[str] = max(citation_dates) if citation_dates else (
+    latest_source_date: Optional[str] = max(citation_dates) if citation_dates else (
         ao.get("answer_date") or None
     )
+    answer_as_of = latest_source_date  # backward compat: callers expecting answer_as_of get source date
 
     # ── Recency flag on primary citation ─────────────────────────────────────
     doc_recency: Optional[str] = None
@@ -245,6 +285,7 @@ def generate_answer(state: Dict[str, Any]) -> Dict[str, Any]:
     needs_judge = classification.get("needs_judge", [])
     conflicts: List[Dict[str, Any]] = []
     has_llm_issues = False
+    judge_output = None
 
     enable_judge = os.getenv("ENABLE_LLM_JUDGE", "1") not in ("0", "false", "False")
     if enable_judge and needs_judge:
@@ -265,8 +306,8 @@ def generate_answer(state: Dict[str, Any]) -> Dict[str, Any]:
             explanation_parts.append(
                 f"These specific facts weren't found in the source documents: {display}"
             )
-    if has_llm_issues:
-        unsupported = judge_output.get("unsupported", []) if enable_judge and needs_judge else []
+    if has_llm_issues and judge_output is not None:
+        unsupported = judge_output.get("unsupported", [])
         if unsupported:
             first = unsupported[0].get("claim", "")[:100]
             explanation_parts.append(
@@ -285,14 +326,16 @@ def generate_answer(state: Dict[str, Any]) -> Dict[str, Any]:
     # ── missing_doc_types (only for partial/not_found) ────────────────────────
     missing_doc_types: List[str] = []
     if answer_status in ("partial", "not_found"):
-        missing_doc_types = _infer_missing_doc_types(query, all_docs)
+        missing_doc_types = _infer_missing_doc_types(query, all_docs, customer_id=customer_id)
 
     return {
         "answer": answer_text,
         "answer_status": answer_status,
         "citation": primary_citation,
         "citations": all_citations,
-        "answer_as_of": answer_as_of,
+        "answer_as_of": answer_as_of,          # backward compat: latest source date
+        "reference_date": reference_date,       # date the answer was computed for (today)
+        "latest_source_date": latest_source_date,  # max doc_date across cited sources
         "confidence_explanation": confidence_explanation,
         "sources_searched": len(all_docs),
         "recency_flag": doc_recency,

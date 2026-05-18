@@ -6,9 +6,12 @@ Applies 3-layer hallucination check per claim.
 Detects stale sources (doc_date > as_of_date - 30 days).
 """
 
+import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List
+
+_log = logging.getLogger(__name__)
 
 from pydantic_models import (
     PreMeetingBrief,
@@ -159,7 +162,7 @@ def generate_pre_meeting_brief(state: Dict[str, Any]) -> PreMeetingBrief:
     Pydantic model, runs hallucination checks on open_items, collects
     stale warnings, and returns the fully typed PreMeetingBrief.
     """
-    as_of_date = state.get("as_of_date") or datetime.utcnow().strftime("%Y-%m-%d")
+    as_of_date = state.get("as_of_date") or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     last_call_date = state.get("last_call_date") or None
 
     # ── Overdue commitments ───────────────────────────────────────────────────
@@ -185,6 +188,18 @@ def generate_pre_meeting_brief(state: Dict[str, Any]) -> PreMeetingBrief:
         for item in (state.get("open_items_data") or [])
         if isinstance(item, dict)
     ]
+    # Deduplicate by normalized title — same ticket can appear in multiple chunks
+    _seen_titles: set = set()
+    _deduped: List[OpenItem] = []
+    for _item in raw_open_items:
+        _key = (_item.title or "").strip().lower()
+        if _key and _key in _seen_titles:
+            continue
+        if _key:
+            _seen_titles.add(_key)
+        _deduped.append(_item)
+    raw_open_items = _deduped
+
     open_items = _run_hallucination_check_on_open_items(raw_open_items, all_docs)
 
     # ── Recent changes ────────────────────────────────────────────────────────
@@ -249,6 +264,11 @@ def generate_pre_meeting_brief(state: Dict[str, Any]) -> PreMeetingBrief:
         try:
             sa_raw = raw.get("source_a") or {}
             sb_raw = raw.get("source_b") or {}
+            claim_a = raw.get("claim") or sa_raw.get("claim") or raw.get("topic") or ""
+            claim_b = sb_raw.get("claim") or ""
+            if not claim_a or not claim_b:
+                _log.warning("conflict_skipped_empty_claim raw=%s", str(raw)[:120])
+                continue
             source_a = SourceCitation(
                 document=sa_raw.get("chunk_id") or sa_raw.get("document") or "unknown",
                 doc_date=sa_raw.get("doc_date") or "",
@@ -258,9 +278,9 @@ def generate_pre_meeting_brief(state: Dict[str, Any]) -> PreMeetingBrief:
                 doc_date=sb_raw.get("doc_date") or "",
             )
             conflicts.append(Conflict(
-                claim_a=raw.get("claim") or sa_raw.get("claim") or raw.get("topic") or "",
+                claim_a=claim_a,
                 source_a=source_a,
-                claim_b=sb_raw.get("claim") or "",
+                claim_b=claim_b,
                 source_b=source_b,
             ))
             conflict_sources.add(source_a.document)
@@ -350,74 +370,3 @@ def generate_brief(state: Dict[str, Any]) -> Dict[str, Any]:
     brief = generate_pre_meeting_brief(state)
     return brief.model_dump()
 
-
-# ── Legacy helpers — kept for any callers that still import them ───────────────
-
-def _strip_context_prefix(content: str, metadata: Dict[str, Any]) -> str:
-    """Remove the '[Context: ...]\\n\\n' prefix added by contextual retrieval."""
-    if not metadata.get("has_context_prefix"):
-        return content
-    if not content.startswith("[Context:"):
-        return content
-    close_bracket = content.find("]", len("[Context:"))
-    if close_bracket == -1:
-        return content
-    if content[close_bracket:close_bracket + 3] != "]\n\n":
-        return content
-    return content[close_bracket + 3:]
-
-
-def _resolve_cited_item(
-    item: Any,
-    chunk_map: Dict[str, Any],
-    text_key: str,
-) -> Dict[str, Any]:
-    """Add source_doc, doc_date, and passage fields to a cited item dict."""
-    if not isinstance(item, dict):
-        return {
-            text_key: str(item), "chunk_id": None,
-            "source_doc": None, "doc_date": None, "passage": None,
-        }
-
-    chunk_id = item.get("chunk_id")
-    doc = chunk_map.get(chunk_id) if chunk_id else None
-
-    source_doc = None
-    doc_date = None
-    passage = None
-    if doc:
-        source_doc = (
-            doc.metadata.get("filename")
-            or os.path.basename(doc.metadata.get("source", ""))
-            or None
-        )
-        doc_date = doc.metadata.get("doc_date")
-        raw = _strip_context_prefix(doc.page_content, doc.metadata)
-        passage = raw[:200].strip()
-
-    return {
-        text_key: item.get(text_key, ""),
-        "chunk_id": chunk_id,
-        "source_doc": source_doc,
-        "doc_date": doc_date,
-        "passage": passage,
-    }
-
-
-def _build_sources(docs: List[Any]) -> List[Dict[str, str]]:
-    """Deduplicated list of source doc names from retrieved documents."""
-    seen: set = set()
-    sources = []
-    for doc in docs:
-        name = (
-            doc.metadata.get("filename")
-            or os.path.basename(doc.metadata.get("source", ""))
-            or "unknown"
-        )
-        if name not in seen:
-            seen.add(name)
-            sources.append({
-                "filename": name,
-                "doc_type": doc.metadata.get("doc_type", ""),
-            })
-    return sources

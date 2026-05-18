@@ -115,7 +115,11 @@ def should_run_judge(query: str, faithfulness: float, n_claims: int,
 # (threshold too low) and the current 0.0-always bug (threshold too high for OpenAI).
 # Override either via env var for custom calibration.
 _THRESHOLD_BY_PROVIDER = {"openai": 0.45, "huggingface": 0.65}
-_FAITHFULNESS_THRESHOLD = float(os.getenv("FAITHFULNESS_THRESHOLD", "0"))  # 0 = auto
+try:
+    _FAITHFULNESS_THRESHOLD = float(os.getenv("FAITHFULNESS_THRESHOLD", "0"))  # 0 = auto
+except ValueError:
+    _log.warning("FAITHFULNESS_THRESHOLD env var is not a valid float; using auto-select")
+    _FAITHFULNESS_THRESHOLD = 0.0
 
 
 def _get_faithfulness_threshold() -> float:
@@ -496,7 +500,10 @@ def llm_judge_claims(claim_texts: list, retrieved_docs) -> dict:
             if not isinstance(v, dict):
                 continue
             if v.get("verdict", "").lower() == "unsupported":
-                idx = v.get("index", 0) - 1
+                raw_idx = v.get("index")
+                if raw_idx is None:
+                    continue  # missing index → can't map to a claim safely
+                idx = raw_idx - 1  # LLM uses 1-based numbering
                 if 0 <= idx < len(claim_texts):
                     unsupported.append({
                         "claim": claim_texts[idx],

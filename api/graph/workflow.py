@@ -6,8 +6,16 @@ Exec 1:1 brief:     START → exec nodes (parallel) → recommended_approach →
 Query:              query_rewrite → retrieve → answer → generate_answer
 """
 
+import re as _re
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
+
+# Detects temporal queries about overdue/past-due commitments so the rewrite node
+# can inject a sub-query tuned to surface "OVERDUE by N days" chunk text.
+_OVERDUE_INTENT_RE = _re.compile(
+    r"\b(overdue|past[\s_-]?due|behind[\s_-]?schedule|missed[\s_-]?deadline|slipped|late[\s_-]?commitment)\b",
+    _re.IGNORECASE,
+)
 
 from langgraph.graph import StateGraph, END, START
 
@@ -111,6 +119,13 @@ def _query_rewrite_node(state: GraphState) -> dict:
         llm_breaker.on_failure()
         _log.warning("query_rewrite_failed error=%s", str(e))
         sub_queries = [question]
+
+    # For overdue/temporal queries, prepend a sub-query that targets the
+    # "OVERDUE by N days" text baked into commitment chunks at ingest.
+    if _OVERDUE_INTENT_RE.search(question):
+        overdue_sq = "OVERDUE commitment overdue by days tracker"
+        if overdue_sq not in sub_queries:
+            sub_queries = [overdue_sq] + sub_queries[:3]
 
     return {"sub_queries": sub_queries,
             "audit_trail": [{"node": "query_rewrite", "sub_queries": sub_queries}]}
@@ -316,9 +331,6 @@ async def run_query_workflow(
     return await _query_workflow.ainvoke(initial_state)
 
 
-# ── Legacy compatibility wrappers ─────────────────────────────────────────────
-# Old /brief and /lookup callers in tests still use run_workflow / run_lookup_workflow.
-# These forward to the new runners so nothing breaks during transition.
 
 async def run_workflow(
     customer_id: str,

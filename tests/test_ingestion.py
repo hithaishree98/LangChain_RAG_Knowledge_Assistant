@@ -83,7 +83,7 @@ class TestCommitmentCSVParser:
         commitments = parse_csv(sample_commitments_csv_file)
         assert len(commitments) == 3
         assert commitments[0].description == "SSO integration delivery"
-        assert commitments[0].status == "open"
+        assert commitments[0].status == "active"
 
     def test_is_slipped_computed(self, tmp_path):
         from ingestion.commitment_parser import parse_csv

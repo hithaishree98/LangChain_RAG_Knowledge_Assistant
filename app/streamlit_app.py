@@ -89,6 +89,17 @@ def api_post_files(path, files, data=None):
         return {"error": str(e)}
 
 
+def api_delete(path):
+    try:
+        r = requests.delete(f"{API_URL}{path}", headers=_headers(), timeout=30)
+        r.raise_for_status()
+        return {}
+    except requests.HTTPError as e:
+        return {"error": f"HTTP {e.response.status_code}: {e.response.text[:200]}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # ── Session state defaults ────────────────────────────────────────────────────
 
 if "selected_customer" not in st.session_state:
@@ -103,6 +114,10 @@ if "query_result" not in st.session_state:
     st.session_state.query_result = None
 if "corpus_health" not in st.session_state:
     st.session_state.corpus_health = None
+if "account_health" not in st.session_state:
+    st.session_state.account_health = None
+if "people_cache" not in st.session_state:
+    st.session_state.people_cache = {}  # customer_id → list of people
 
 
 # ── Display helpers ───────────────────────────────────────────────────────────
@@ -122,12 +137,21 @@ def render_commitment(c: dict):
         cols[1].caption(f"Owner: {c['owner']}")
     cols[2].caption(f"Status: {c.get('status', 'open')}")
     src = c.get("source") or {}
-    if isinstance(src, dict) and src.get("is_stale"):
-        st.warning("Source may be stale")
+    if isinstance(src, dict):
+        doc_name = src.get("document", "")
+        if doc_name and doc_name not in ("unknown", ""):
+            stale_tag = " ⚠️ stale" if src.get("is_stale") else ""
+            st.markdown(
+                f'<div class="source-detail">📄 {_html.escape(doc_name)}'
+                f'<span style="color:#f59e0b;">{_html.escape(stale_tag)}</span></div>',
+                unsafe_allow_html=True,
+            )
+        elif src.get("is_stale"):
+            st.warning("Source may be stale")
 
 
 def render_open_item(item: dict):
-    priority = item.get("priority", "normal")
+    priority = item.get("priority") or "normal"
     badge = {
         "P0": "🔴 P0",
         "P1": "🟠 P1",
@@ -148,6 +172,14 @@ def render_open_item(item: dict):
         f"Owner: {item.get('owner', '')} | "
         f"Updated: {item.get('last_update', 'unknown')}"
     )
+    src = item.get("source") or {}
+    if isinstance(src, dict):
+        doc_name = src.get("document", "")
+        if doc_name and doc_name not in ("unknown", ""):
+            st.markdown(
+                f'<div class="source-detail">📄 {_html.escape(doc_name)}</div>',
+                unsafe_allow_html=True,
+            )
 
 
 def section_status_label(status: str) -> str:
@@ -163,7 +195,7 @@ def section_status_label(status: str) -> str:
 
 with st.sidebar:
     st.markdown("### FDE Assistant")
-    st.caption("Single-workspace demo — all data is scoped to one API key.")
+    
     st.markdown("---")
 
     if st.button("Refresh customers", use_container_width=True):
@@ -201,6 +233,7 @@ with st.sidebar:
         if selected and selected != st.session_state.selected_customer:
             st.session_state.selected_customer = selected
             st.session_state.corpus_health = None
+            st.session_state.account_health = None
             st.session_state.pre_brief = None
             st.session_state.exec_brief = None
             st.session_state.query_result = None
@@ -293,12 +326,105 @@ st.markdown(
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 
-tab_brief, tab_exec, tab_query, tab_upload = st.tabs(
-    ["Pre-Meeting Brief", "Exec 1:1 Brief", "Query", "Upload Documents"]
+tab_health, tab_brief, tab_exec, tab_query, tab_upload = st.tabs(
+    ["Account Health", "Pre-Meeting Brief", "Exec 1:1 Brief", "Query", "Upload Documents"]
 )
 
 
-# ── Tab 1: Pre-Meeting Brief ──────────────────────────────────────────────────
+# ── Tab 1: Account Health ────────────────────────────────────────────────────
+
+with tab_health:
+    col_refresh, _ = st.columns([1, 3])
+    with col_refresh:
+        if st.button("Refresh", key="refresh_health", use_container_width=True):
+            st.session_state.account_health = None
+
+    if st.session_state.account_health is None:
+        with st.spinner("Computing account health..."):
+            health_data = api_get(f"/customers/{customer_id}/health-score")
+            if "error" not in (health_data or {}):
+                st.session_state.account_health = health_data
+
+    ah = st.session_state.account_health or {}
+
+    if "error" in ah:
+        st.error(ah["error"])
+    elif not ah:
+        st.info("Upload documents to compute account health.")
+    else:
+        band = ah.get("health_band", "Unknown")
+        score = ah.get("health_score", 0)
+        band_color = {"Healthy": "#22c55e", "At Risk": "#f59e0b", "Critical": "#ef4444"}.get(band, "#888")
+
+        st.markdown(
+            f'<div style="padding:16px;background:#16161f;border:2px solid {band_color};'
+            f'border-radius:10px;margin-bottom:20px;text-align:center;">'
+            f'<div style="font-size:13px;color:#8888aa;margin-bottom:4px;">ACCOUNT HEALTH</div>'
+            f'<div style="font-size:36px;font-weight:700;color:{band_color};">{band}</div>'
+            f'<div style="font-size:14px;color:#8888aa;margin-top:4px;">Score: {score}/100</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        col1, col2, col3, col4 = st.columns(4)
+
+        def _kpi(col, label, value, note="", color=None):
+            c = color or "#e8e8f0"
+            note_html = (
+                '<div style="font-size:11px;color:#55556a;margin-top:2px;">'
+                + note + "</div>"
+            ) if note else ""
+            col.markdown(
+                f'<div style="padding:12px;background:#16161f;border:1px solid #2a2a3a;'
+                f'border-radius:8px;text-align:center;">'
+                f'<div style="font-size:28px;font-weight:700;color:{c};">{value}</div>'
+                f'<div style="font-size:12px;color:#8888aa;margin-top:4px;">{label}</div>'
+                f'{note_html}'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+        p0 = ah.get("open_p0_count", 0)
+        p1 = ah.get("open_p1_count", 0)
+        overdue = ah.get("overdue_commitment_count", 0)
+        days_call = ah.get("days_since_last_call")
+        slip_pct = int(ah.get("commitment_slip_rate", 0) * 100)
+        total_open = ah.get("total_open_commitments", 0)
+        total_commit = ah.get("total_commitments", 0)
+
+        _kpi(col1, "Open P0 Tickets", p0,
+             color="#ef4444" if p0 > 0 else "#22c55e")
+        _kpi(col2, "Overdue Commitments", overdue,
+             f"{total_open} open of {total_commit} total",
+             color="#ef4444" if overdue > 0 else "#22c55e")
+        _kpi(col3, "Days Since Last Call",
+             days_call if days_call is not None else "—",
+             "⚠ approaching 30" if days_call and days_call > 14 else "",
+             color="#f59e0b" if days_call and days_call > 14 else "#e8e8f0")
+        _kpi(col4, "Commitment Slip Rate", f"{slip_pct}%",
+             f"P1 open: {p1}",
+             color="#ef4444" if slip_pct > 40 else "#f59e0b" if slip_pct > 20 else "#22c55e")
+
+        missing = ah.get("missing_doc_types", [])
+        if missing:
+            st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+            st.markdown(
+                f'<div style="padding:10px 14px;background:#1a1a10;border:1px solid #f59e0b;'
+                f'border-radius:6px;font-size:12px;color:#f59e0b;">'
+                f'⚠ Missing doc types: <strong>{", ".join(missing)}</strong> — '
+                f'upload these to improve brief quality.</div>',
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+        st.caption(
+            "Health score = 100 − (P0×20) − (P1×5) − (overdue commitments×10) "
+            "− (slip rate×30) − (days since call penalty after 14 days). "
+            "Computed from document metadata — no LLM calls."
+        )
+
+
+# ── Tab 2: Pre-Meeting Brief ──────────────────────────────────────────────────
 
 with tab_brief:
     col_date, col_btn = st.columns([2, 1])
@@ -661,12 +787,15 @@ with tab_exec:
 
     col_person, col_btn2 = st.columns([2, 1])
     with col_person:
-        people_result = api_get(f"/customers/{customer_id}/people")
-        people = []
-        if isinstance(people_result, list):
-            people = people_result
-        elif isinstance(people_result, dict) and "error" not in people_result:
-            people = people_result.get("people") or []
+        if customer_id not in st.session_state.people_cache:
+            people_result = api_get(f"/customers/{customer_id}/people")
+            if isinstance(people_result, list):
+                st.session_state.people_cache[customer_id] = people_result
+            elif isinstance(people_result, dict) and "error" not in people_result:
+                st.session_state.people_cache[customer_id] = people_result.get("people") or []
+            else:
+                st.session_state.people_cache[customer_id] = []
+        people = st.session_state.people_cache.get(customer_id, [])
 
         if people:
             person_names = [p.get("name", str(p.get("id", ""))) for p in people]
@@ -698,6 +827,7 @@ with tab_exec:
                 )
                 if add_result and "error" not in add_result:
                     st.success(f"Added {new_name.strip()}. Reload to select them.")
+                    st.session_state.people_cache.pop(customer_id, None)
                     st.rerun()
                 else:
                     st.error((add_result or {}).get("error", "Failed to add person."))
@@ -921,6 +1051,8 @@ with tab_query:
         answer_status = qr.get("answer_status", "not_found")
         answer = qr.get("answer", "")
         answer_as_of = qr.get("answer_as_of") or ""
+        reference_date = qr.get("reference_date") or ""
+        latest_source_date = qr.get("latest_source_date") or answer_as_of
         confidence_explanation = qr.get("confidence_explanation") or ""
         sources_searched = qr.get("sources_searched", 0)
         all_citations = qr.get("citations") or []
@@ -932,10 +1064,17 @@ with tab_query:
             "not_found": "#ef4444", "error": "#ef4444",
         }
         status_color = status_colors.get(answer_status, "#6b7280")
+        date_parts = []
+        if reference_date:
+            date_parts.append(f"computed for: {_html.escape(reference_date)}")
+        if latest_source_date and latest_source_date != reference_date:
+            date_parts.append(f"sources as of: {_html.escape(latest_source_date)}")
+        elif not reference_date and answer_as_of:
+            date_parts.append(f"as of {_html.escape(answer_as_of)}")
         as_of_html = (
             f' <span style="font-size:11px;color:#55556a;margin-left:8px;">'
-            f'as of {_html.escape(answer_as_of)}</span>'
-            if answer_as_of else ""
+            f'{" · ".join(date_parts)}</span>'
+            if date_parts else ""
         )
         st.markdown(
             f'<div style="margin-bottom:6px;">'
@@ -1047,45 +1186,94 @@ with tab_query:
         )
 
 
-# ── Tab 4: Upload Documents ───────────────────────────────────────────────────
+# ── Tab 5: Upload Documents ───────────────────────────────────────────────────
 
 with tab_upload:
     st.markdown(f"Upload documents for **{customer_name}**.")
-
-    st.markdown(
-        '<div style="padding:10px 14px;background:#16161f;border:1px solid #2a2a3a;'
-        'border-left:3px solid #f59e0b;border-radius:6px;margin-bottom:16px;">'
-        '<strong style="color:#f59e0b;">Required filename format:</strong><br>'
-        '<code style="color:#e8e8f0;font-size:13px;">YYYY-MM-DD_doctype_descriptor.ext</code><br>'
-        '<span style="color:#8888aa;font-size:11px;">'
-        'Example: 2024-03-15_transcript_qbr-call.pdf</span>'
-        '</div>',
-        unsafe_allow_html=True,
+    st.caption(
+        "Drag in any file — the system auto-detects the document type. "
+        "Confirm or override the detected type before uploading."
     )
 
     _DOC_TYPES = [
         "transcript",
         "ticket",
-        "qbr_deck",
         "commitment_tracker",
         "account_notes",
+        "qbr_deck",
         "solution_architecture",
     ]
+
+    # Client-side type sniffing mirrors the server-side logic so the dropdown
+    # pre-fills before the file is uploaded, giving the user a chance to correct it.
+    def _client_sniff(filename: str, content: bytes) -> str | None:
+        import json as _json
+        ext = os.path.splitext(filename.lower())[1]
+        if ext in (".vtt", ".srt"):
+            return "transcript"
+        if ext == ".txt":
+            try:
+                sample = content[:4096].decode("utf-8", errors="replace")
+                import re as _re
+                if len(_re.findall(r"^[A-Za-z][A-Za-z0-9 _\-]{1,40}:\s+\S", sample, _re.MULTILINE)) >= 2:
+                    return "transcript"
+            except Exception:
+                pass
+            return None
+        if ext == ".json":
+            try:
+                obj = _json.loads(content[:8192])
+                items = obj if isinstance(obj, list) else obj.get("commitments") or []
+                first = items[0] if (items and isinstance(items, list)) else obj
+                if isinstance(first, dict):
+                    keys = {k.lower() for k in first}
+                    if keys & {"commitment_id", "promised_date", "current_target_date", "target_date"}:
+                        return "commitment_tracker"
+                    if "fields" in keys or keys & {"ticket_id", "subject", "priority"}:
+                        return "ticket"
+            except Exception:
+                pass
+            return None
+        if ext == ".csv":
+            try:
+                sample = content[:2048].decode("utf-8", errors="replace")
+                hdrs = {h.strip().lower() for h in sample.split("\n")[0].split(",")}
+                if hdrs & {"commitment_id", "promised_date", "current_target_date", "target_date"}:
+                    return "commitment_tracker"
+                if hdrs & {"ticket_id", "issue_key", "summary"}:
+                    return "ticket"
+            except Exception:
+                pass
+            return None
+        return None  # PDF/DOCX/HTML — let user choose
 
     uploaded_file = st.file_uploader(
         "Choose a file",
         type=["pdf", "docx", "html", "txt", "json", "csv"],
-        help=(
-            "Supported: .pdf, .docx, .html, .txt, .json, .csv. "
-            "For best results, name files like YYYY-MM-DD_doctype_descriptor.ext"
-        ),
+        help="Supported: .pdf .docx .html .txt .json .csv",
     )
 
+    # Pre-fill doc_type from client-side sniff, fall back to first option
+    default_type = "transcript"
+    if uploaded_file is not None:
+        sniffed = _client_sniff(uploaded_file.name, uploaded_file.getvalue())
+        if sniffed and sniffed in _DOC_TYPES:
+            default_type = sniffed
+
+    doc_type_idx = _DOC_TYPES.index(default_type) if default_type in _DOC_TYPES else 0
     doc_type = st.selectbox(
         "Document type",
         options=_DOC_TYPES,
-        help="Select the type of document being uploaded.",
+        index=doc_type_idx,
+        help="Auto-detected from file content. Override if incorrect.",
     )
+
+    if uploaded_file is not None and _client_sniff(uploaded_file.name, uploaded_file.getvalue()):
+        sniffed = _client_sniff(uploaded_file.name, uploaded_file.getvalue())
+        if sniffed == doc_type:
+            st.caption(f"✓ Auto-detected as **{doc_type}**")
+        else:
+            st.caption(f"Auto-detected **{sniffed}** — overridden to **{doc_type}**")
 
     replace_existing = st.checkbox(
         "Replace if already uploaded",
@@ -1095,6 +1283,7 @@ with tab_upload:
 
     if uploaded_file and st.button("Upload", use_container_width=True):
         with st.spinner("Uploading and indexing..."):
+            uploaded_file.seek(0)
             files = {"file": (uploaded_file.name, uploaded_file, uploaded_file.type)}
             data = {
                 "doc_type": doc_type,
@@ -1107,11 +1296,15 @@ with tab_upload:
         else:
             chunks = result.get("chunks", "?")
             doc_date = result.get("doc_date", "")
+            warnings = result.get("warnings") or []
             msg = f"Uploaded successfully. Chunks indexed: {chunks}."
             if doc_date:
                 msg += f" Document date: {doc_date}."
             st.success(msg)
+            for w in warnings:
+                st.info(w)
             st.session_state.corpus_health = None
+            st.session_state.account_health = None
 
     if not uploaded_file:
         st.markdown(
@@ -1120,3 +1313,25 @@ with tab_upload:
             'Select a file above to upload</div>',
             unsafe_allow_html=True,
         )
+
+    st.divider()
+    with st.expander("Indexed documents", expanded=False):
+        docs = api_get(f"/customers/{customer_id}/documents")
+        if isinstance(docs, dict) and "error" in docs:
+            st.error(f"Could not load documents: {docs['error']}")
+        elif not docs:
+            st.caption("No documents indexed yet.")
+        else:
+            for doc in docs:
+                col_name, col_date, col_btn = st.columns([5, 3, 1])
+                col_name.markdown(f"`{_html.escape(doc.get('filename', ''))}`")
+                ts = doc.get("upload_timestamp", "")
+                col_date.caption(ts[:10] if ts else "")
+                if col_btn.button("Delete", key=f"del_{doc['id']}"):
+                    result = api_delete(f"/customers/{customer_id}/documents/{doc['id']}")
+                    if "error" in result:
+                        st.error(result["error"])
+                    else:
+                        st.session_state.corpus_health = None
+                        st.session_state.account_health = None
+                        st.rerun()
