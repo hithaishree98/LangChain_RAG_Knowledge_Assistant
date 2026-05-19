@@ -1,8 +1,6 @@
 # LangChain RAG Knowledge Assistant
 
-Account managers go into customer calls without the right context. They rely on whoever took notes last quarter, stale slide decks, or a ten-minute skim that misses the thing the customer actually raised. The information exists — transcripts, ticket exports, commitment trackers, QBR decks — it's just scattered and nobody reads all of it.
-
-I wanted to fix that but not by just handing everything to an LLM. "Summarize these documents" produces confident hallucinations. You can't walk into a customer meeting and cite "the model said so." I needed structured extraction, verifiable citations, and an explicit not-found signal when the evidence isn't there instead of a fabricated answer.
+Account managers walk into customer calls without context. The notes are scattered — a ticket export, a transcript, a commitment tracker. I built this to pull it together without just handing everything to an LLM. If the answer isn't in the uploaded documents, it says so instead of making something up.
 
 ## Architecture
 
@@ -41,31 +39,29 @@ Documents (PDF · DOCX · HTML · TXT · JSON · CSV)
                                            + cross-encoder rerank
 ```
 
-## Features
+## What it generates
 
-**Pre-meeting brief** — one click generates overdue commitments, open tickets sorted by P0/P1/P2, recent changes, outstanding commitments, anticipated questions with verbatim source quotes, and a posture directive (Lead/Acknowledge/Defer/Push) tied to a specific ticket or commitment ID.
+**Pre-meeting brief** — one click before a customer call gives you overdue commitments, open tickets sorted by P0/P1/P2, recent changes, outstanding commitments, anticipated questions with verbatim source quotes, and a posture directive (Lead/Acknowledge/Defer/Push) tied to a specific ticket or commitment ID. 
 
-**Exec 1:1 brief** — for a named stakeholder: role and tenure, what they've said on record with sentiment tags, recent signals, open asks; sections with no evidence are dropped rather than fabricated.
+**Exec 1:1 brief** — same idea for a named stakeholder: what they've said on record (with sentiment tags), their open asks, recent signals, and recommended approach. Sections with no source evidence are dropped rather than filled with guesses.
 
-**Query** — free-form question, rewritten into sub-queries if broad, runs hybrid retrieval, validates every cited chunk ID against what was actually retrieved, runs three-layer hallucination detection, returns `ok`/`partial`/`not_found` with an explanation.
+**Query** — ask a free-form question about a customer, get an answer that cites which document it came from. Broad questions get decomposed into sub-queries automatically. Returns `ok`, `partial`, or `not_found` — `partial` means the answer was found but something didn't verify cleanly.
 
-**Account health** — 0–100 score from P0 ticket count, overdue commitments, commitment slip rate, and days since last call; no LLM; computed from metadata alone.
+**Account health** — a 0–100 score from P0/P1 ticket counts, overdue commitments, commitment slip rate, and days since last call. Pure metadata arithmetic, no LLM call.
 
-**Multi-tenant isolation** — SHA256(workspace:passkey)[:32] is the user_id; enforced at storage layer in every ChromaDB and SQLite query with no bypass path.
+## How it works
 
-**Format-aware ingestion** — PDF/DOCX/HTML get parent-child chunking (2400-char parents, 800-char children); transcripts get turn-boundary chunks; tickets get section chunks; commitment trackers produce one chunk per commitment with `is_overdue`/`is_slipped`/`is_open` stamped from field values at ingest, not at query time.
+**Multi-tenant isolation** — every workspace credential hashes to a user_id (SHA256(workspace:passkey)[:32]) stored on every record in ChromaDB and SQLite. Two customers can both have a ticket called "login issue." Without user_id in every `where` clause, a query would return both. The filter is at the storage layer, so a bug in the API layer can't accidentally bypass it.
 
-**Hybrid retrieval** — BM25 + dense cosine + RRF (k=60) + cross-encoder reranker (top_k=6) + max-2-per-source diversity cap; commitment and ticket queries bypass embeddings via ChromaDB `where` filters.
+**Format-aware ingestion** — documents chunk differently depending on their type. PDFs and Word docs get parent-child splits: 800-char children are embedded for retrieval, 2400-char parents are fetched by ID at query time to give the LLM the surrounding context. Transcripts chunk at speaker-turn boundaries — splitting mid-speaker loses who said what. Commitment trackers produce one chunk per commitment with `is_overdue`, `is_slipped`, and `is_open` computed from the actual field values and baked into the chunk text at ingest. The LLM never has to decide if something is overdue; it reads "OVERDUE by 14 days" directly in the source. Uploading a replacement file marks the old one as superseded, scoped by (customer_id, doc_type, filename).
 
-**Hallucination detection** — regex over nine atomic fact patterns → claim classifier (routes to verified/flagged/needs_judge) → batched LLM judge for only the ambiguous claims; answer downgrades from `ok` to `partial` on any unresolved flag.
+**Hybrid retrieval** — queries run BM25 and dense cosine independently (k=10 each), merge with Reciprocal Rank Fusion, then rerank the top candidates with ms-marco-MiniLM-L-6-v2 (top_k=6). For commitment and ticket queries, embeddings are skipped entirely — ChromaDB `where` filters on status and priority fields are more precise than semantic search for that kind of lookup.
 
-**Staleness thresholds** — commitment_tracker: 14d; transcripts/tickets/account_notes: 30d; QBR decks: 90d; solution architecture: 180d; stale sources are flagged in every citation.
+**Hallucination detection** — answers go through three layers: regex checks for atomic facts (dates, dollar amounts, version strings, SLA values), a classifier routes each claim to verified/flagged/needs_judge, then only the ambiguous ones go to the LLM judge in a single batched call. Any unresolved flag downgrades the answer from `ok` to `partial`.
 
-**Circuit breaker** — 10 LLM failures open the breaker; 30-second recovery window; thread-safe; failures return structured partial results rather than 500s.
+**Staleness awareness** — each doc type has a freshness threshold: commitment trackers 14d, transcripts/tickets/account notes 30d, QBR decks 90d, solution architecture 180d. Past-threshold sources get a stale warning in citations rather than being silently treated as current.
 
-**Deterministic commitment fields** — `is_overdue`, `is_slipped`, `is_open` are computed at ingest from actual field values; the LLM cannot mark something overdue that the data doesn't support.
-
-**Version tracking** — uploading a replacement marks the previous as superseded, scoped by (customer_id, doc_type, filename); old chunks stay indexed but are excluded from fresh queries via `is_latest_version` filter.
+**Circuit breaker** — after 10 LLM failures the breaker opens, and subsequent calls return immediately rather than queuing retries. Recovery window is 30 seconds. During a rate limit event, without this a single brief would fire off 30+ retrying API calls and block for minutes. With it, failed section nodes return their `@_safe` fallback (empty result, status "unavailable") and the rest of the brief still generates.
 
 ## Quick start
 
@@ -84,6 +80,6 @@ Seed demo data:
 docker compose exec api python scripts/demo_seed.py
 ```
 
-Optional env vars: `LLM_MODEL` (default: `gemini-2.5-flash`), `OPENAI_API_KEY` (switches embedder to `text-embedding-3-small`), `SLACK_WEBHOOK_URL` (daily overdue digest at 08:00 UTC), `CONTEXTUAL_RETRIEVAL=1` (prepends LLM-generated context to each chunk before embedding).
+Optional env vars: `LLM_MODEL` (default: `gemini-2.5-flash`), `OPENAI_API_KEY` (switches embedder to `text-embedding-3-small`), `SLACK_WEBHOOK_URL` (daily overdue digest at 08:00 UTC), `CONTEXTUAL_RETRIEVAL=1` (prepends LLM-generated context to each chunk before embedding — adds one LLM call per chunk at ingest).
 
 FastAPI · LangGraph · ChromaDB · SQLite · Gemini · sentence-transformers · rank-bm25 · Streamlit · APScheduler
