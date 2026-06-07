@@ -1,6 +1,6 @@
 # LangChain RAG Knowledge Assistant
 
-Account managers walk into customer calls without context. The notes are scattered — a ticket export, a transcript, a commitment tracker. I built this to pull it together without just handing everything to an LLM. If the answer isn't in the uploaded documents, it says so instead of making something up.
+FDE's need to have context before they walk into customer meeetings. The notes are scattered — a ticket export, a transcript, a commitment tracker. I built this to pull it together without just handing everything to an LLM. If the answer isn't in the uploaded documents, it says so instead of making something up.
 
 ## Architecture
 
